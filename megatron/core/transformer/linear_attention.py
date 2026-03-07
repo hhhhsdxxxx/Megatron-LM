@@ -122,6 +122,44 @@ class LinearAttention(Attention):
             skip_bias_add=False,
         )
 
+        # Initialize QKV projection (required by get_query_key_value_tensors)
+        # P1 Fix: Use global head counts because ColumnParallelLinear automatically shards output_size
+        # Using per-partition counts would cause double-partitioning in TP environments
+        self.query_projection_size = config.kv_channels * config.num_attention_heads
+        self.kv_projection_size = config.kv_channels * config.num_query_groups
+        self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
+        self.linear_qkv = submodules.linear_qkv(
+            config.hidden_size,
+            self.linear_qkv_out_dim,
+            config=config,
+            init_method=config.init_method,
+            gather_output=False,
+            bias=config.add_bias_linear or config.add_qkv_bias,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_comm_buffer_name='qkv',
+            tp_group=self.pg_collection.tp,
+        )
+
+        # Initialize QK layernorm if enabled
+        if submodules.q_layernorm is not None:
+            self.q_layernorm = submodules.q_layernorm(
+                hidden_size=self.hidden_size_per_attention_head,
+                config=config,
+                eps=config.layernorm_epsilon,
+            )
+        else:
+            self.q_layernorm = None
+
+        if submodules.k_layernorm is not None:
+            self.k_layernorm = submodules.k_layernorm(
+                hidden_size=self.hidden_size_per_attention_head,
+                config=config,
+                eps=config.layernorm_epsilon,
+            )
+        else:
+            self.k_layernorm = None
+
     @staticmethod
     def _build_slope_tensor(n_attention_heads: int) -> Tensor:
         """Build slope tensor for Lightning Attention-2.
@@ -195,26 +233,25 @@ class LinearAttention(Attention):
             If split_qkv=True: (q, k, v)
             If split_qkv=False: (qkv, split_indices)
         """
-        # TODO: Full implementation in Phase 2
-        # For now, return placeholder to satisfy abstract method requirement
         if not split_qkv:
             # Return packed QKV with split indices
             qkv, _ = self.linear_qkv(hidden_states)
-            # Split indices for [q_heads, kv_heads, kv_heads]
+            # Split indices for [q_heads, kv_heads, kv_heads] using TP-local counts
             split_indices = [
-                self.config.num_attention_heads * self.config.kv_channels,
-                self.config.num_query_groups * self.config.kv_channels,
-                self.config.num_query_groups * self.config.kv_channels,
+                self.num_attention_heads_per_partition * self.config.kv_channels,
+                self.num_query_groups_per_partition * self.config.kv_channels,
+                self.num_query_groups_per_partition * self.config.kv_channels,
             ]
             return qkv, split_indices
 
         # Project to QKV
         qkv, _ = self.linear_qkv(hidden_states)
 
-        # Split into Q, K, V
-        # Shape: [sq, b, (num_heads + 2*num_kv_heads) * head_dim]
-        q_size = self.config.num_attention_heads * self.config.kv_channels
-        kv_size = self.config.num_query_groups * self.config.kv_channels
+        # Split into Q, K, V using TP-local head counts
+        # Shape: [sq, b, (num_heads_per_partition + 2*num_kv_heads_per_partition) * head_dim]
+        # Use TP-local head counts since QKV projection is tensor-parallel (gather_output=False)
+        q_size = self.num_attention_heads_per_partition * self.config.kv_channels
+        kv_size = self.num_query_groups_per_partition * self.config.kv_channels
 
         q = qkv[:, :, :q_size]
         k = qkv[:, :, q_size:q_size + kv_size]
@@ -270,6 +307,10 @@ class LinearAttention(Attention):
             - output_tensor: shape [sq, b, h]
             - attention_bias: None (not used in linear attention)
         """
+        # P2 Fix: Map deprecated inference_params to inference_context
+        if inference_params is not None and inference_context is None:
+            inference_context = inference_params
+
         # Validate attention mask - LinearAttention only supports 2D masks
         if attention_mask is not None and attention_mask.dim() == 4:
             raise ValueError(
@@ -284,35 +325,185 @@ class LinearAttention(Attention):
         # Use fused_recurrent for short sequences (<=64), chunk for longer sequences
         mode = 'fused_recurrent' if sq <= 64 else 'chunk'
 
-        # TODO: Project to QKV
-        # qkv, _ = self.linear_qkv(hidden_states)
+        # Project to QKV and split
+        q, k, v = self.get_query_key_value_tensors(
+            hidden_states=hidden_states,
+            key_value_states=key_value_states,
+            output_gate=False,
+            split_qkv=True,
+        )
 
-        # TODO: Split QKV into separate tensors
-        # q, k, v = split_qkv(qkv)
+        # Get dimensions for reshaping
+        sq, b = hidden_states.size(0), hidden_states.size(1)
 
-        # TODO: Apply QK normalization
-        # q = self.q_layernorm(q) if self.q_layernorm else q
-        # k = self.k_layernorm(k) if self.k_layernorm else k
+        # P1 Fix: Reshape Q/K before applying QK layernorm
+        # q and k are currently [sq, b, num_heads * head_dim]
+        # Reshape to [sq, b, num_heads, head_dim] before normalization
+        q = q.view(sq, b, self.num_attention_heads_per_partition, self.hidden_size_per_attention_head)
+        k = k.view(sq, b, self.num_query_groups_per_partition, self.hidden_size_per_attention_head)
 
-        # TODO: Apply rotary position embeddings
-        # if rotary_pos_emb is not None:
-        #     q, k = apply_rotary_pos_emb(q, k, rotary_pos_emb)
+        # Apply QK normalization if enabled (now with correct shape)
+        if self.q_layernorm is not None:
+            q = self.q_layernorm(q)
+        if self.k_layernorm is not None:
+            k = self.k_layernorm(k)
 
-        # TODO: Handle GQA (grouped query attention)
-        # if num_kv_heads < num_query_heads:
-        #     k, v = repeat_kv(k, v, num_query_heads // num_kv_heads)
+        # P1 Fix: Apply RoPE on per-head Q/K tensors
+        # Keep q and k in [sq, b, num_heads, head_dim] shape for RoPE
+        # Megatron's RoPE helpers expect per-head layout where last dim is head_dim
+        if rotary_pos_cos is not None and rotary_pos_sin is not None:
+            # Use cos/sin directly
+            from megatron.core.models.common.embeddings.rope_utils import (
+                apply_rotary_pos_emb_with_cos_sin,
+            )
 
-        # TODO: Apply GLA kernel (chunk or fused_recurrent)
-        # gla_fn = self.gla_ops[mode]
-        # attn_output = gla_fn(q, k, v, self.slope, ...)
+            q = apply_rotary_pos_emb_with_cos_sin(
+                q, rotary_pos_cos, rotary_pos_sin, rotary_interleaved=self.config.rotary_interleaved
+            )
+            k = apply_rotary_pos_emb_with_cos_sin(
+                k, rotary_pos_cos, rotary_pos_sin, rotary_interleaved=self.config.rotary_interleaved
+            )
+        elif rotary_pos_emb is not None:
+            # Use rotary_pos_emb (freqs)
+            from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 
-        # TODO: Apply GroupRMSNorm and gating
-        # g = self.g_proj(hidden_states)
-        # g = self.g_norm(g)
-        # output = attn_output * g
+            # Handle tuple format (q_pos_emb, k_pos_emb)
+            if isinstance(rotary_pos_emb, tuple):
+                q_pos_emb, k_pos_emb = rotary_pos_emb
+            else:
+                q_pos_emb = k_pos_emb = rotary_pos_emb
 
-        # TODO: Apply output projection
-        # output, _ = self.linear_proj(output)
+            if q_pos_emb is not None:
+                q = apply_rotary_pos_emb(
+                    q,
+                    q_pos_emb,
+                    config=self.config,
+                    cu_seqlens=None,  # Not using packed sequences
+                    mscale=1.0,
+                )
+            if k_pos_emb is not None:
+                k = apply_rotary_pos_emb(
+                    k,
+                    k_pos_emb,
+                    config=self.config,
+                    cu_seqlens=None,
+                    mscale=1.0,
+                )
 
-        # Placeholder return - just pass through hidden_states
-        return hidden_states, None
+        # Flatten q and k back to [sq, b, num_heads * head_dim] after RoPE
+        q = q.view(sq, b, -1)
+        k = k.view(sq, b, -1)
+
+        # Reshape Q, K, V for GLA kernel
+        # Megatron format: [sq, b, num_heads * head_dim]
+        # GLA format: [b, sq, num_heads, head_dim]
+        sq, b = q.size(0), q.size(1)
+        num_heads = self.config.num_attention_heads
+        num_kv_heads = self.config.num_query_groups
+        head_dim = self.config.kv_channels
+
+        # Reshape Q: [sq, b, num_heads * head_dim] -> [b, sq, num_heads, head_dim]
+        q = q.view(sq, b, num_heads, head_dim).transpose(0, 1).contiguous()
+
+        # Reshape K, V: [sq, b, num_kv_heads * head_dim] -> [b, sq, num_kv_heads, head_dim]
+        k = k.view(sq, b, num_kv_heads, head_dim).transpose(0, 1).contiguous()
+        v = v.view(sq, b, num_kv_heads, head_dim).transpose(0, 1).contiguous()
+
+        # Handle GQA (grouped query attention) - expand K, V if needed
+        if num_kv_heads < num_heads:
+            # Repeat K, V to match num_heads
+            # [b, sq, num_kv_heads, head_dim] -> [b, sq, num_heads, head_dim]
+            num_groups = num_heads // num_kv_heads
+            k = k.repeat_interleave(num_groups, dim=2)
+            v = v.repeat_interleave(num_groups, dim=2)
+
+        # Handle inference context (KV cache for recurrent state)
+        recurrent_state = None
+        output_final_state = False
+
+        if inference_context is not None:
+            # For LinearAttention, we store recurrent_state instead of K/V tensors
+            # The recurrent_state has shape [batch, num_heads, head_dim, head_dim]
+            output_final_state = True
+
+            # P1 Fix: Reset recurrent state when new inference sequence starts
+            # Check if this is the first token of a new sequence (sequence_len_offset == 0)
+            # to avoid contaminating outputs with previous request's state
+            is_first_token = False
+            if hasattr(inference_context, 'sequence_len_offset'):
+                is_first_token = inference_context.sequence_len_offset == 0
+            elif sequence_len_offset is not None:
+                is_first_token = sequence_len_offset == 0
+
+            # Retrieve cached recurrent state from inference context
+            if hasattr(inference_context, 'key_value_memory_dict') and not is_first_token:
+                layer_key = f'layer_{self.layer_number}'
+                if layer_key in inference_context.key_value_memory_dict:
+                    cached_state = inference_context.key_value_memory_dict[layer_key]
+                    if cached_state is not None:
+                        # P2 Fix: Extract recurrent_state from tuple format for compatibility
+                        # StaticInferenceContext utilities expect KV-style tuples
+                        recurrent_state = cached_state[0] if isinstance(cached_state, tuple) else cached_state
+                        # Ensure recurrent_state is on the same device
+                        if recurrent_state.device != hidden_states.device:
+                            recurrent_state = recurrent_state.to(hidden_states.device).contiguous()
+
+        # Handle left-padding for first generation step
+        # When recurrent_state is None (first step), apply attention_mask to value_states
+        # to zero out padded positions
+        if recurrent_state is None and attention_mask is not None and output_final_state:
+            # attention_mask shape: [batch, seq_len] with 0 for padding, 1 for valid
+            # Expand to match v shape: [b, sq, num_heads, head_dim]
+            # Use in-place multiplication for efficiency
+            mask_expanded = attention_mask[:, -sq:, None, None]  # [b, sq, 1, 1]
+            v = v * mask_expanded
+
+        # Apply GLA kernel
+        gla_fn = self.gla_ops[mode]
+
+        # Prepare slope tensor: [num_heads] -> [b, sq, num_heads]
+        slope_expanded = self.slope[None, None, :].expand(b, sq, num_heads)
+
+        # Call GLA kernel
+        # Returns: (output, recurrent_state)
+        attn_output, recurrent_state = gla_fn(
+            q=q,
+            k=k,
+            v=v,
+            g=slope_expanded,
+            initial_state=recurrent_state,
+            output_final_state=output_final_state,
+        )
+
+        # Store recurrent state back to inference context if needed
+        if output_final_state and inference_context is not None:
+            if hasattr(inference_context, 'key_value_memory_dict'):
+                layer_key = f'layer_{self.layer_number}'
+                # P2 Fix: Store recurrent_state as (recurrent_state, None) tuple
+                # This maintains compatibility with StaticInferenceContext utilities
+                # that expect KV-style tuples for swap_key_value_dict() and __eq__()
+                inference_context.key_value_memory_dict[layer_key] = (recurrent_state, None)
+
+        # Reshape output back to Megatron format
+        # GLA output: [b, sq, num_heads, head_dim]
+        # Megatron format: [sq, b, num_heads * head_dim]
+        attn_output = attn_output.transpose(0, 1).contiguous()
+        attn_output = attn_output.view(sq, b, num_heads * head_dim)
+
+        # Apply GroupRMSNorm and gating
+        # IMPORTANT: Apply g_norm to attention output (not gate), matching reference implementation
+        # Reference: o = g_norm(o); g_proj = g_proj(hidden); o = o * sigmoid(g_proj)
+        attn_output = self.g_norm(attn_output)
+
+        # Project hidden_states to get gate values
+        gate, _ = self.g_proj(hidden_states)
+
+        # Apply gating with sigmoid activation (in-place for efficiency)
+        # output = normalized_attn_output * sigmoid(gate)
+        attn_output = attn_output * torch.sigmoid_(gate)
+
+        # Apply output projection
+        output, output_bias = self.linear_proj(attn_output)
+
+        # Return output and bias (matching Attention interface)
+        return output, output_bias
