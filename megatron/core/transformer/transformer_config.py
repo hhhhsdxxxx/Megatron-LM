@@ -68,6 +68,10 @@ class TransformerConfig(ModelParallelConfig):
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
+    mtp_variant: str = "standard"
+    """MTP variant to use. Options include 'fused' for fused MTP implementation.
+    'standard' means using the default MTP implementation."""
+
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints.
@@ -216,6 +220,21 @@ class TransformerConfig(ModelParallelConfig):
     """Frequency of full attention layers among sliding window attention layers. Accepts either:
     - An integer N: Represents a (N-1):1 ratio, one full attention layer after (N-1) SWA layers.
     - A list that defines a custom pattern, e.g.: [1,1,1,1,0,0,0,0], where 1 represents SWA. """
+
+    layer_group_size: int = 1
+    """Number of layers in each group for hybrid attention patterns.
+    Used to organize layers into groups where different attention mechanisms can be applied."""
+
+    use_linear_attention: bool = False
+    """Whether to use linear attention mechanism instead of standard softmax attention."""
+
+    linear_attn_norm_group_size: int = 4
+    """Group size for normalization in linear attention.
+    Defines how many groups to use for group-based normalization in linear attention layers."""
+
+    linear_attn_norm_group_type: str = "group_diff"
+    """Type of group normalization to use in linear attention.
+    Options include 'group_diff' for group-based differential normalization."""
 
     normalization: Literal['LayerNorm', 'RMSNorm'] = "LayerNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
