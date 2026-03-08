@@ -92,11 +92,13 @@ class LinearAttention(Attention):
 
         # Build layer-dependent slope tensor
         # The slope varies by layer to provide different decay patterns
-        # Formula: slope = -base_slope * (1 - (layer_idx - 1) / (num_layers - 1) + 1e-5)
+        # Reference formula uses 0-indexed layer_idx:
+        #   slope = -base_slope * (1 - (layer_idx - 1) / (num_layers - 1) + 1e-5)
+        # Megatron's layer_number is 1-indexed, so we convert: layer_idx_0based = layer_number - 1
+        # Substituting: (layer_idx_0based - 1) = (layer_number - 1 - 1) = (layer_number - 2)
         base_slope = self._build_slope_tensor(config.num_attention_heads)
-        layer_idx = layer_number
         num_layers = config.num_layers
-        slope = -base_slope * (1 - (layer_idx - 1) / max(num_layers - 1, 1) + 1e-5)
+        slope = -base_slope * (1 - (layer_number - 2) / max(num_layers - 1, 1) + 1e-5)
 
         # Register slope as buffer (non-persistent, will be recomputed)
         self.register_buffer('slope', slope, persistent=False)
@@ -127,8 +129,13 @@ class LinearAttention(Attention):
         # Initialize QKV projection (required by get_query_key_value_tensors)
         # P1 Fix: Use global head counts because ColumnParallelLinear automatically shards output_size
         # Using per-partition counts would cause double-partitioning in TP environments
+        #
+        # Reference alignment: LinearAttention always uses MHA (num_kv_heads == num_q_heads),
+        # regardless of the global num_query_groups config (which may differ for MLA layers).
+        # Override kv_projection_size and num_query_groups_per_partition accordingly.
         self.query_projection_size = config.kv_channels * config.num_attention_heads
-        self.kv_projection_size = config.kv_channels * config.num_query_groups
+        self.kv_projection_size = config.kv_channels * config.num_attention_heads
+        self.num_query_groups_per_partition = self.num_attention_heads_per_partition
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
         self.linear_qkv = submodules.linear_qkv(
             config.hidden_size,

@@ -144,6 +144,10 @@ def bailing_moe_linear_v2_block_spec(
 
     MTP handling: gpt_builders.py passes this block spec to get_gpt_mtp_block_spec,
     which extracts the last decoder layer (MLA + MoE) as the MTP model layer.
+    Note on MTP RoPE: The reference passes the linear-attention RoPE to MTP's MLA,
+    but MLA ignores external rotary_pos_emb (asserts it's None) and uses its own
+    internal RoPE with qk_pos_emb_head_dim. This is correct because both produce
+    the same dimension (qk_rope_head_dim == head_dim * partial_rotary_factor).
 
     The layer architecture is determined by config parameters:
     - config.linear_attention_freq: Controls which layers use Linear Attention vs MLA
@@ -162,6 +166,27 @@ def bailing_moe_linear_v2_block_spec(
     from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
     use_te = config.transformer_impl == "transformer_engine"
+
+    # Validate: reference BailingMoE v2.5 has no gate on shared experts
+    assert not config.moe_shared_expert_gate, (
+        "BailingMoE Linear V2 reference has no gate on shared experts. "
+        "Set --no-moe-shared-expert-gate or remove --moe-shared-expert-gate."
+    )
+
+    # Validate: reference BailingMoE v2.5 uses the same bias setting for both QKV and
+    # output projection in MLA. Megatron controls output projection bias via add_bias_linear
+    # and QKV bias via add_qkv_bias. These must be consistent to align with the reference.
+    if config.add_qkv_bias != config.add_bias_linear:
+        import warnings
+
+        warnings.warn(
+            "BailingMoE Linear V2 reference uses the same bias setting (use_qkv_bias) for "
+            "both QKV projections and the MLA output projection. In Megatron, add_qkv_bias="
+            f"{config.add_qkv_bias} but add_bias_linear={config.add_bias_linear}. "
+            "This mismatch will cause the MLA output projection bias to differ from the "
+            "reference. Set both to the same value for alignment.",
+            stacklevel=2,
+        )
 
     # Get backend
     if use_te:
