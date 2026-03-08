@@ -21,7 +21,7 @@
 
 import math
 import warnings
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Callable
 
 import torch
 import torch.nn.functional as F
@@ -37,26 +37,24 @@ from transformers.modeling_attn_mask_utils import (
 )
 from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import PreTrainedModel
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS, is_torch_greater_or_equal_than_1_13
 from transformers.utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
-    is_flash_attn_2_available,
-    is_flash_attn_greater_or_equal_2_10,
     logging,
     replace_return_docstrings,
 )
 from transformers.utils.import_utils import is_torch_fx_available
-from .configuration_bailing_moe_linear_v2 import BailingMoeLinearV2Config
+from .configuration_bailing_moe_v2_5 import BailingMoeV2_5Config
 from transformers.generation.utils import GenerationMixin
 from dataclasses import dataclass
 from transformers.utils import ModelOutput
-
-
-if is_flash_attn_2_available():
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
-    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+from transformers import DynamicLayer
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs
+from transformers.utils.deprecation import deprecate_kwarg
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 
 from fla.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
 from fla.ops.simple_gla.chunk import chunk_simple_gla
@@ -73,7 +71,7 @@ if is_torch_fx_available():
 
 logger = logging.get_logger(__name__)
 
-_CONFIG_FOR_DOC = "BailingMoeLinearV2Config"
+_CONFIG_FOR_DOC = "BailingMoeV2_5Config"
 
 
 def roll_tensor(tensor, shifts=-1, dims=-1, fill_value=0):
@@ -86,7 +84,7 @@ def roll_tensor(tensor, shifts=-1, dims=-1, fill_value=0):
 
 
 @dataclass
-class MoEV2CausalLMOutputWithPast(ModelOutput):
+class MoEV2_5CausalLMOutputWithPast(ModelOutput):
     """
     Base class for causal language model (or autoregressive) outputs as well as Mixture of Expert's router hidden
     states terms, to train a MoE model.
@@ -130,7 +128,7 @@ class MoEV2CausalLMOutputWithPast(ModelOutput):
     mtp_logits: Optional[tuple[torch.FloatTensor, ...]] = None
 
 
-class MoeV2ModelOutputWithPast(MoeModelOutputWithPast):
+class MoeV2_5ModelOutputWithPast(MoeModelOutputWithPast):
 
     def __init__(self, mtp_hidden_states=None, **kwargs):
         super().__init__(**kwargs)
@@ -151,7 +149,7 @@ def _get_unpad_data(attention_mask):
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     warnings.warn(
-        "Calling `transformers.models.BailingMoeV2.modeling_BailingMoeV2._prepare_4d_attention_mask` is deprecated and will be removed in v4.37. Use `transformers.modeling_attn_mask_utils._prepare_4d_attention_mask"
+        "Calling `transformers.models.BailingMoeV2_5.modeling_BailingMoeV2_5._prepare_4d_attention_mask` is deprecated and will be removed in v4.37. Use `transformers.modeling_attn_mask_utils._prepare_4d_attention_mask"
     )
     return _prepare_4d_attention_mask(mask=mask, dtype=dtype, tgt_len=tgt_len)
 
@@ -160,17 +158,17 @@ def _make_causal_mask(
     input_ids_shape: torch.Size, dtype: torch.dtype, device: torch.device, past_key_values_length: int = 0
 ):
     warnings.warn(
-        "Calling `transformers.models.BailingMoeV2.modeling_BailingMoeV2._make_causal_mask` is deprecated and will be removed in v4.37. Use `transformers.models.BailingMoeV2.modeling_BailingMoeV2.AttentionMaskConverter._make_causal_mask"
+        "Calling `transformers.models.BailingMoeV2_5.modeling_BailingMoeV2_5._make_causal_mask` is deprecated and will be removed in v4.37. Use `transformers.models.BailingMoeV2_5.modeling_BailingMoeV2_5.AttentionMaskConverter._make_causal_mask"
     )
     return AttentionMaskConverter._make_causal_mask(
         input_ids_shape=input_ids_shape, dtype=dtype, device=device, past_key_values_length=past_key_values_length
     )
 
 
-class BailingMoeV2RMSNorm(nn.Module):
+class BailingMoeV2_5RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
-        BailingMoeV2RMSNorm is equivalent to T5LayerNorm
+        BailingMoeV2_5RMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -184,10 +182,10 @@ class BailingMoeV2RMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
-class BailingMoeV2GroupRMSNorm(nn.Module):
+class BailingMoeV2_5GroupRMSNorm(nn.Module):
     def __init__(self, hidden_size, group_norm_size, eps=1e-6):
         """
-        BailingMoeV2RMSNorm is equivalent to T5LayerNorm
+        BailingMoeV2_5RMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -206,11 +204,11 @@ class BailingMoeV2GroupRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype).view(input_shape)
 
 
-ALL_LAYERNORM_LAYERS.append(BailingMoeV2RMSNorm)
+ALL_LAYERNORM_LAYERS.append(BailingMoeV2_5RMSNorm)
 
 
-class BailingMoeV2RotaryEmbedding(nn.Module):
-    def __init__(self, config: BailingMoeLinearV2Config, device=None):
+class BailingMoeV2_5RotaryEmbedding(nn.Module):
+    def __init__(self, config: BailingMoeV2_5Config, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
@@ -287,8 +285,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-class BailingMoeV2MLP(nn.Module):
-    def __init__(self, config: BailingMoeLinearV2Config, intermediate_size: int):
+class BailingMoeV2_5MLP(nn.Module):
+    def __init__(self, config: BailingMoeV2_5Config, intermediate_size: int):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -303,7 +301,7 @@ class BailingMoeV2MLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
-class BailingMoeV2Gate(nn.Module):
+class BailingMoeV2_5Gate(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -367,26 +365,26 @@ class BailingMoeV2Gate(nn.Module):
         return topk_idx, topk_weight, logits
 
 
-class BailingMoeV2SparseMoeBlock(nn.Module):
+class BailingMoeV2_5SparseMoeBlock(nn.Module):
     """
     A mixed expert module containing shared experts.
     """
 
-    def __init__(self, config: BailingMoeLinearV2Config):
+    def __init__(self, config: BailingMoeV2_5Config):
         super().__init__()
         self.config = config
         self.num_experts_per_tok = config.num_experts_per_tok
         self._setup_experts()
-        self.gate = BailingMoeV2Gate(config)
+        self.gate = BailingMoeV2_5Gate(config)
         if config.num_shared_experts is not None:
-            self.shared_experts = BailingMoeV2MLP(
+            self.shared_experts = BailingMoeV2_5MLP(
                 config=config, intermediate_size=config.moe_intermediate_size * config.num_shared_experts
             )
 
     def _setup_experts(self):
         self.experts = nn.ModuleList(
             [
-                BailingMoeV2MLP(config=self.config, intermediate_size=self.config.moe_intermediate_size)
+                BailingMoeV2_5MLP(config=self.config, intermediate_size=self.config.moe_intermediate_size)
                 for _ in range(self.config.num_experts)
             ]
         )
@@ -444,7 +442,7 @@ class BailingMoeV2SparseMoeBlock(nn.Module):
 
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int, head_first: bool = True) -> torch.Tensor:  
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int, head_first: bool = True) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). If head_first is True, the hidden states go from (batch,
     num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
@@ -461,443 +459,259 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int, head_first: bool = True) 
         return hidden_states.reshape(batch, slen, num_key_value_heads * n_rep, head_dim)
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaAttention with Llama->BailingMoeV2
-class BailingMoeV2Attention(nn.Module):
+def repeat_kv2(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def eager_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs: Unpack[TransformersKwargs],
+):
+    key_states = repeat_kv2(key, module.num_key_value_groups)
+    value_states = repeat_kv2(value, module.num_key_value_groups)
+
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        attn_weights = attn_weights + causal_mask
+
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, attn_weights
+
+
+def apply_rotary_pos_emb_interleave(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    r"""
+    TODO let's just use the original freqcis computation to not have the view
+    transpose + reshape! This is not optimized!
+    Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`):
+            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
+            used to pass offsetted position ids when working with a KV-cache.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+
+    b, h, s, d = q.shape
+    q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+
+    b, h, s, d = k.shape
+    k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+class BailingMoeV2_5MLARotaryEmbedding(nn.Module):
+    inv_freq: torch.Tensor  # fix linting for `register_buffer`
+
+    def __init__(self, config: BailingMoeV2_5Config, device=None):
+        super().__init__()
+        # BC: "rope_type" was originally "type"
+        if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
+            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+        else:
+            self.rope_type = "default"
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+
+        self.config = config
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+
+    @torch.no_grad()
+    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
+    def forward(self, x, position_ids):
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+def yarn_get_mscale(scale=1, mscale=1):
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
+class BailingMoeV2_5MultiLatentAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: BailingMoeLinearV2Config, layer_idx: Optional[int] = None):
+    def __init__(self, config: BailingMoeV2_5Config, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        if layer_idx is None:
-            logger.warning_once(
-                f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
-                "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
-                "when creating this class."
-            )
-
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.attention_dropout = config.attention_dropout
-        self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.head_dim = config.head_dim or self.hidden_size // self.num_heads
-        partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
-        self.rope_dim = int(self.head_dim * partial_rotary_factor)
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
-        self.is_causal = True
+        self.q_lora_rank = config.q_lora_rank
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.kv_lora_rank = config.kv_lora_rank
+        self.v_head_dim = config.v_head_dim
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_head_dim = config.qk_head_dim
 
-        self.query_key_value = nn.Linear(
-            self.hidden_size,
-            (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim,
+        self.is_causal = True
+        if self.q_lora_rank is None:
+            self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.qk_head_dim, bias=False)
+        else:
+            self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.use_qkv_bias)
+            self.q_a_layernorm = BailingMoeV2_5RMSNorm(config.q_lora_rank)
+            self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
+
+        self.kv_a_proj_with_mqa = nn.Linear(
+            config.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=config.use_qkv_bias,
+        )
+        self.kv_a_layernorm = BailingMoeV2_5RMSNorm(self.kv_lora_rank)
+        self.kv_b_proj = nn.Linear(
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
+        )
+
+        self.dense = nn.Linear(
+            self.num_heads * self.v_head_dim,
+            config.hidden_size,
             bias=config.use_qkv_bias,
         )
 
-        if self.config.use_qk_norm:
-            self.query_layernorm = BailingMoeV2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            self.key_layernorm = BailingMoeV2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.dense = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.use_bias)
+        self.scaling = self.qk_head_dim ** (-0.5)
+        if self.config.rope_scaling is not None:
+            mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
+            scaling_factor = self.config.rope_scaling["factor"]
+            if mscale_all_dim:
+                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+                self.scaling = self.scaling * mscale * mscale
 
-    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
-        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-
+    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
 
-        bsz, q_len, _ = hidden_states.size()
+        batch_size, seq_length = hidden_states.shape[:-1]
+        query_shape = (batch_size, seq_length, -1, self.qk_head_dim)
+        key_shape = (batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
 
-        qkv = self.query_key_value(hidden_states)
-        qkv = qkv.view(bsz, q_len, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
-
-        query_states, key_states, value_states = qkv.split(
-            [self.num_heads, self.num_key_value_heads, self.num_key_value_heads], dim=-2
-        )
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
-
-        if self.config.use_qk_norm:
-            query_states = self.query_layernorm(query_states)
-            key_states = self.key_layernorm(key_states)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if past_key_value is not None:
-            if self.layer_idx is None:
-                raise ValueError(
-                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
-                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
-                    "with a layer index."
-                )
-            cache_kwargs = {"sin": sin, "cos": cos}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        kv_seq_len = key_states.shape[-2]
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask
-
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-
-        attn_output = attn_output.reshape(bsz, q_len, -1)
-
-        attn_output = self.dense(attn_output)
-
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
-
-
-# Copied from transformers.models.llama.modeling_llama.LlamaFlashAttention2 with Llama->BailingMoeV2
-class BailingMoeV2FlashAttention2(BailingMoeV2Attention):
-    """
-    BailingMoeV2 flash attention module. This module inherits from `BailingMoeV2Attention` as the weights of the module stays
-    untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
-    flash attention and deal with padding tokens in case the input contains any of them.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
-        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
-        # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
-        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        # BailingMoeV2FlashAttention2 attention does not support output_attentions
-        output_attentions = False
-
-        bsz, q_len, _ = hidden_states.size()
-
-        # Flash attention requires the input to have the shape
-        # batch_size x seq_length x head_dim x hidden_dim
-        # therefore we just need to keep the original shape
-
-        qkv = self.query_key_value(hidden_states)
-        qkv = qkv.view(bsz, q_len, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
-
-        query_states, key_states, value_states = qkv.split(
-            [self.num_heads, self.num_key_value_heads, self.num_key_value_heads], dim=-2
-        )
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
-
-        if self.config.use_qk_norm:
-            query_states = self.query_layernorm(query_states)
-            key_states = self.key_layernorm(key_states)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
-        # to be able to avoid many of these transpose/reshape/view.
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
-
-        dropout_rate = self.attention_dropout if self.training else 0.0
-
-        # In PEFT, usually we cast the layer norms in float32 for training stability reasons
-        # therefore the input hidden states gets silently cast in float32. Hence, we need
-        # cast them back in the correct dtype just to be sure everything works as expected.
-        # This might slow down training & inference so it is recommended to not cast the LayerNorms
-        # in fp32. (BailingMoeV2RMSNorm handles it correctly)
-
-        input_dtype = query_states.dtype
-        if input_dtype == torch.float32:
-            # Handle the case where the model is quantized
-            if hasattr(self.config, "_pre_quantization_dtype"):
-                target_dtype = self.config._pre_quantization_dtype
-            elif torch.is_autocast_enabled():
-                target_dtype = torch.get_autocast_gpu_dtype()
-            else:
-                target_dtype = self.query_key_value.weight.dtype
-
-            logger.warning_once(
-                f"The input hidden states seems to be silently casted in float32, this might be related to"
-                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
-                f" {target_dtype}."
-            )
-
-            query_states = query_states.to(target_dtype)
-            key_states = key_states.to(target_dtype)
-            value_states = value_states.to(target_dtype)
-
-        attn_output = self._flash_attention_forward(
-            query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
-        )
-
-        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
-        attn_output = self.dense(attn_output)
-
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
-
-    def _flash_attention_forward(
-        self, query_states, key_states, value_states, attention_mask, query_length, dropout=0.0, softmax_scale=None
-    ):
-        """
-        Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
-        first unpad the input, then computes the attention scores and pad the final attention scores.
-        Args:
-            query_states (`torch.Tensor`):
-                Input query states to be passed to Flash Attention API
-            key_states (`torch.Tensor`):
-                Input key states to be passed to Flash Attention API
-            value_states (`torch.Tensor`):
-                Input value states to be passed to Flash Attention API
-            attention_mask (`torch.Tensor`):
-                The padding mask - corresponds to a tensor of size `(batch_size, seq_len)` where 0 stands for the
-                position of padding tokens and 1 for the position of non-padding tokens.
-            dropout (`int`, *optional*):
-                Attention dropout
-            softmax_scale (`float`, *optional*):
-                The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
-            query_length (`int`):
-                The length of the query sequence in terms of tokens. This represents the number of tokens in the
-                `query_states` tensor along the sequence dimension. It is used to determine the effective sequence
-                length for attention computations.
-        """
-        if not self._flash_attn_uses_top_left_mask:
-            causal = self.is_causal
+        if self.q_lora_rank is None:
+            q_states = self.q_proj(hidden_states)
         else:
-            # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in BailingMoeV2FlashAttention2 __init__.
-            causal = self.is_causal and query_length != 1
+            q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+        q_states = q_states.view(query_shape).transpose(1, 2)
+        q_pass, q_rot = torch.split(q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        # Contains at least one padding token in the sequence
-        if attention_mask is not None:
-            batch_size = query_states.shape[0]
-            query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
-                query_states, key_states, value_states, attention_mask, query_length
-            )
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+        k_pass, k_rot = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 
-            cu_seqlens_q, cu_seqlens_k = cu_seq_lens
-            max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
+        k_pass = self.kv_b_proj(self.kv_a_layernorm(k_pass)).view(key_shape).transpose(1, 2)
+        k_pass, value_states = torch.split(k_pass, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-            attn_output_unpad = flash_attn_varlen_func(
-                query_states,
-                key_states,
-                value_states,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_in_batch_q,
-                max_seqlen_k=max_seqlen_in_batch_k,
-                dropout_p=dropout,
-                softmax_scale=softmax_scale,
-                causal=causal,
-            )
+        k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
 
-            attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
+        cos, sin = position_embeddings  # tptest
+        if self.config.rope_interleave:  # support using interleaved weights for efficiency
+            q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin)
         else:
-            attn_output = flash_attn_func(
-                query_states, key_states, value_states, dropout, softmax_scale=softmax_scale, causal=causal
-            )
+            x = 1 / 0
+            q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
+        k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
 
-        return attn_output
+        query_states = torch.cat((q_pass, q_rot), dim=-1)
+        key_states = torch.cat((k_pass, k_rot), dim=-1)
 
-    def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
-        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
-        batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
+        if past_key_values is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        key_layer = index_first_axis(
-            key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
-        )
-        value_layer = index_first_axis(
-            value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
-        )
-        if query_length == kv_seq_len:
-            query_layer = index_first_axis(
-                query_layer.reshape(batch_size * kv_seq_len, self.num_heads, head_dim), indices_k
-            )
-            cu_seqlens_q = cu_seqlens_k
-            max_seqlen_in_batch_q = max_seqlen_in_batch_k
-            indices_q = indices_k
-        elif query_length == 1:
-            max_seqlen_in_batch_q = 1
-            cu_seqlens_q = torch.arange(
-                batch_size + 1, dtype=torch.int32, device=query_layer.device
-            )  # There is a memcpy here, that is very bad.
-            indices_q = cu_seqlens_q[:-1]
-            query_layer = query_layer.squeeze(1)
-        else:
-            # The -q_len: slice assumes left padding.
-            attention_mask = attention_mask[:, -query_length:]
-            query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(query_layer, attention_mask)
+        if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
+            value_states = F.pad(value_states, [0, self.qk_head_dim - self.v_head_dim])
 
-        return (
-            query_layer,
-            key_layer,
-            value_layer,
-            indices_q,
-            (cu_seqlens_q, cu_seqlens_k),
-            (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
-        )
+        attention_interface: Callable = eager_attention_forward
 
+        if self.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-# Copied from transformers.models.llama.modeling_llama.LlamaSdpaAttention with Llama->BailingMoeV2
-class BailingMoeV2SdpaAttention(BailingMoeV2Attention):
-    """
-    BailingMoeV2 attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
-    `BailingMoeV2Attention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
-    SDPA API.
-    """
-
-    # Adapted from BailingMoeV2Attention.forward
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        if output_attentions:
-            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
-            logger.warning_once(
-                "BailingMoeV2Model is using BailingMoeV2SdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
-                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-            )
-            return super().forward(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-            )
-
-        bsz, q_len, _ = hidden_states.size()
-
-        qkv = self.query_key_value(hidden_states)
-        qkv = qkv.view(bsz, q_len, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
-
-        query_states, key_states, value_states = qkv.split(
-            [self.num_heads, self.num_key_value_heads, self.num_key_value_heads], dim=-2
-        )
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
-
-        if self.config.use_qk_norm:
-            query_states = self.query_layernorm(query_states)
-            key_states = self.key_layernorm(key_states)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        if attention_mask is not None:
-            kv_seq_len = key_states.shape[-2]
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-
-        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
-        # Reference: https://github.com/pytorch/pytorch/issues/112577.
-        if query_states.device.type == "cuda" and attention_mask is not None:
-            query_states = query_states.contiguous()
-            key_states = key_states.contiguous()
-            value_states = value_states.contiguous()
-
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
+        attn_output, attn_weights = attention_interface(
+            self,
             query_states,
             key_states,
             value_states,
-            attn_mask=attention_mask,
-            dropout_p=self.attention_dropout if self.training else 0.0,
-            # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
-            is_causal=self.is_causal and attention_mask is None and q_len > 1,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
         )
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, -1)
+        if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
+            attn_output = attn_output[:, :, :, : self.v_head_dim]
 
+        attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
         attn_output = self.dense(attn_output)
-
-        return attn_output, None, past_key_value
-
-
-ATTENTION_CLASSES = {
-    "eager": BailingMoeV2Attention,
-    "flash_attention_2": BailingMoeV2FlashAttention2,
-    "sdpa": BailingMoeV2SdpaAttention,
-}
+        return attn_output, attn_weights, past_key_values
 
 
-class BailingMoeV2LinearAttention(nn.Module):
+class BailingMoeV2_5LinearAttention(nn.Module):
     """
     BailingMoeAttention implements a linear attention mechanism based on Lightning Attention-2
     (https://arxiv.org/abs/2401.04658) with efficient computation using flash-linear-attention operators.
-    
+
     The implementation leverages optimized kernels from the flash-linear-attention library
     (https://github.com/fla-org/flash-linear-attention) for maximum performance.
     """
-    def __init__(self, config: BailingMoeLinearV2Config, layer_idx: Optional[int] = None):
+
+    def __init__(self, config: BailingMoeV2_5Config, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -926,22 +740,23 @@ class BailingMoeV2LinearAttention(nn.Module):
         )
 
         if self.config.use_qk_norm:
-            self.query_layernorm = BailingMoeV2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            self.key_layernorm = BailingMoeV2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.query_layernorm = BailingMoeV2_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.key_layernorm = BailingMoeV2_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        self.rotary_emb = BailingMoeV2RotaryEmbedding(config=config)
+        self.rotary_emb = BailingMoeV2_5RotaryEmbedding(config=config)
 
         self.dense = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.use_bias)
 
         self.g_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.g_norm = BailingMoeV2GroupRMSNorm(self.num_heads * self.head_dim, group_norm_size=config.group_norm_size, eps=self.rms_norm_eps)
-        slope = - BailingMoeV2LinearAttention.build_slope_tensor(self.num_heads) * (1 - (self.layer_idx - 1) / (self.config.num_hidden_layers - 1) + 1e-5)
+        self.g_norm = BailingMoeV2_5GroupRMSNorm(
+            self.num_heads * self.head_dim, group_norm_size=config.group_norm_size, eps=self.rms_norm_eps
+        )
+        slope = -BailingMoeV2_5LinearAttention.build_slope_tensor(self.num_heads) * (
+            1 - (self.layer_idx - 1) / (self.config.num_hidden_layers - 1) + 1e-5
+        )
         self.register_buffer('slope', slope, persistent=False)
 
-        self.lightning_attn_ops = {
-            'chunk': chunk_simple_gla,
-            'fused_recurrent': fused_recurrent_simple_gla
-        }
+        self.lightning_attn_ops = {'chunk': chunk_simple_gla, 'fused_recurrent': fused_recurrent_simple_gla}
 
     @staticmethod
     def build_slope_tensor(n_attention_heads: int):
@@ -949,40 +764,44 @@ class BailingMoeV2LinearAttention(nn.Module):
         Build a tensor of slopes for Lightning Attention-2 as described in the paper:
         "Lightning Attention-2: A Free Lunch for Handling Unlimited Sequence Lengths in Large Language Models"
         (https://arxiv.org/abs/2401.04658)
-        
+
         This function computes the slope values that control the decay rate of attention scores
         based on the number of attention heads. The slopes are designed to have specific
         mathematical properties that work optimally when the number of heads is a power of 2.
-        
+
         For non-power-of-2 head counts, a workaround is implemented to maintain similar properties.
-        
+
         Args:
             n_attention_heads (int): Number of attention heads in the model
-            
+
         Returns:
             torch.Tensor: A tensor of shape [n_attention_heads] containing the computed slopes
-            
+
         Note:
             Code copied from: https://github.com/OpenNLPLab/lightning-attention/blob/d15c38529bbd5c2c82b44ddda3cac885825aa873/lightning_attn/utils/utils.py#L6
-        """    
+        """
+
         def get_slopes(n):
             def get_slopes_power_of_2(n):
                 start = 2 ** (-(2 ** -(math.log2(n) - 3)))
                 ratio = start
-                return [start * ratio ** i for i in range(n)]
+                return [start * ratio**i for i in range(n)]
 
             if math.log2(n).is_integer():
                 return get_slopes_power_of_2(
-                    n)  # In the paper, we only train models that have 2^a heads for some a. This function has
+                    n
+                )  # In the paper, we only train models that have 2^a heads for some a. This function has
             else:  # some good properties that only occur when the input is a power of 2. To maintain that even
                 closest_power_of_2 = 2 ** math.floor(
-                    math.log2(n))  # when the number of heads is not a power of 2, we use this workaround.
-                return (get_slopes_power_of_2(closest_power_of_2)
-                        + get_slopes(2 * closest_power_of_2)[0::2][:n - closest_power_of_2])
+                    math.log2(n)
+                )  # when the number of heads is not a power of 2, we use this workaround.
+                return (
+                    get_slopes_power_of_2(closest_power_of_2)
+                    + get_slopes(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
+                )
 
         slopes = torch.tensor(get_slopes(n_attention_heads), dtype=torch.float)
         return slopes
-
 
     def forward(
         self,
@@ -1006,7 +825,9 @@ class BailingMoeV2LinearAttention(nn.Module):
         mode = 'fused_recurrent' if hidden_states.shape[1] <= 64 else self.mode
 
         # Currently output_attentions can only be False, returning attention weights is not supported
-        assert not output_attentions, "output_attentions can only be False, returning attention weights is not supported"
+        assert (
+            not output_attentions
+        ), "output_attentions can only be False, returning attention weights is not supported"
 
         bsz, q_len, _ = hidden_states.size()
         device = hidden_states.device
@@ -1078,20 +899,20 @@ class BailingMoeV2LinearAttention(nn.Module):
         return o, None, past_key_value
 
 
-class BailingMoeV2MTPLayer(nn.Module):
-    def __init__(self, config: BailingMoeLinearV2Config, layer_idx: int):
+class BailingMoeV2_5MTPLayer(nn.Module):
+    def __init__(self, config: BailingMoeV2_5Config, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
-        self.input_layernorm = BailingMoeV2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.enorm = BailingMoeV2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = BailingMoeV2_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.enorm = BailingMoeV2_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
-        self.post_attention_layernorm = BailingMoeV2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attention = ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
-        self.mlp = BailingMoeV2SparseMoeBlock(config)
+        self.post_attention_layernorm = BailingMoeV2_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attention = BailingMoeV2_5MultiLatentAttention(config=config, layer_idx=layer_idx)
+        self.mlp = BailingMoeV2_5SparseMoeBlock(config)
 
-        self.hnorm = BailingMoeV2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.final_layernorm = BailingMoeV2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = BailingMoeV2_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.final_layernorm = BailingMoeV2_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -1150,28 +971,30 @@ class BailingMoeV2MTPLayer(nn.Module):
         return outputs
 
 
-class BailingMoeLinearV2DecoderLayer(nn.Module):
-    def __init__(self, config: BailingMoeLinearV2Config, layer_idx: int):
+class BailingMoeV2_5DecoderLayer(nn.Module):
+    def __init__(self, config: BailingMoeV2_5Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.attention_layer_type = "attention" if (layer_idx + 1) % config.layer_group_size == 0 or \
-            layer_idx >= config.num_hidden_layers // config.layer_group_size * config.layer_group_size else "linear_attention"
+        self.layer_idx = layer_idx
+        self.attention_layer_type = (
+            "attention"
+            if (layer_idx + 1) % config.layer_group_size == 0
+            or layer_idx >= config.num_hidden_layers // config.layer_group_size * config.layer_group_size
+            else "linear_attention"
+        )
 
         if self.attention_layer_type == "attention":
-            self.attention = ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
+            self.attention = BailingMoeV2_5MultiLatentAttention(config=config, layer_idx=layer_idx)
         else:
-            self.attention = BailingMoeV2LinearAttention(
-                config=config,
-                layer_idx=layer_idx
-            )
+            self.attention = BailingMoeV2_5LinearAttention(config=config, layer_idx=layer_idx)
 
         self.mlp = (
-            BailingMoeV2SparseMoeBlock(config)
+            BailingMoeV2_5SparseMoeBlock(config)
             if (config.num_experts is not None and layer_idx >= config.first_k_dense_replace)
-            else BailingMoeV2MLP(config=config, intermediate_size=config.intermediate_size)
+            else BailingMoeV2_5MLP(config=config, intermediate_size=config.intermediate_size)
         )
-        self.input_layernorm = BailingMoeV2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = BailingMoeV2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = BailingMoeV2_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = BailingMoeV2_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -1179,10 +1002,12 @@ class BailingMoeLinearV2DecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        cache_position: Optional[torch.LongTensor] = None,
         output_attentions: Optional[bool] = False,
         output_router_logits: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        position_embeddings_mla: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -1216,10 +1041,11 @@ class BailingMoeLinearV2DecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                position_embeddings=position_embeddings,
+                past_key_values=past_key_value,
                 use_cache=use_cache,
+                cache_position=cache_position,  #
+                position_embeddings=position_embeddings_mla,  #
+                **kwargs,
             )
         else:
             batch_size, seq_len = hidden_states.shape[0], hidden_states.shape[1]
@@ -1272,7 +1098,7 @@ class BailingMoeLinearV2DecoderLayer(nn.Module):
         return outputs
 
 
-BAILINGMOEV2_START_DOCSTRING = r"""
+BAILINGMOEV2_5_START_DOCSTRING = r"""
     This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
     library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
     etc.)
@@ -1280,7 +1106,7 @@ BAILINGMOEV2_START_DOCSTRING = r"""
     Use it as a regular PyTorch Module and refer to the PyTorch documentation for all matter related to general usage
     and behavior.
     Parameters:
-        config ([`BailingMoeLinearV2Config`]):
+        config ([`BailingMoeV2_5Config`]):
             Model configuration class with all the parameters of the model. Initializing with a config file does not
             load the weights associated with the model, only the configuration. Check out the
             [`~PreTrainedModel.from_pretrained`] method to load the model weights.
@@ -1288,14 +1114,14 @@ BAILINGMOEV2_START_DOCSTRING = r"""
 
 
 @add_start_docstrings(
-    "The bare BailingMoeV2 Model outputting raw hidden-states without any specific head on top.",
-    BAILINGMOEV2_START_DOCSTRING,
+    "The bare BailingMoeV2_5 Model outputting raw hidden-states without any specific head on top.",
+    BAILINGMOEV2_5_START_DOCSTRING,
 )
-class BailingMoeV2PreTrainedModel(PreTrainedModel):
-    config_class = BailingMoeLinearV2Config
+class BailingMoeV2_5PreTrainedModel(PreTrainedModel):
+    config_class = BailingMoeV2_5Config
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["BailingMoeLinearV2DecoderLayer"]
+    _no_split_modules = ["BailingMoeV2_5DecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn_2 = True
     _supports_sdpa = True
@@ -1313,7 +1139,7 @@ class BailingMoeV2PreTrainedModel(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
 
 
-BAILINGMOEV2_INPUTS_DOCSTRING = r"""
+BAILINGMOEV2_5_INPUTS_DOCSTRING = r"""
     Args:
         input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
             Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
@@ -1372,17 +1198,17 @@ BAILINGMOEV2_INPUTS_DOCSTRING = r"""
 
 
 @add_start_docstrings(
-    "The bare BailingMoeV2 Model outputting raw hidden-states without any specific head on top.",
-    BAILINGMOEV2_START_DOCSTRING,
+    "The bare BailingMoeV2_5 Model outputting raw hidden-states without any specific head on top.",
+    BAILINGMOEV2_5_START_DOCSTRING,
 )
-class BailingMoeLinearV2Model(BailingMoeV2PreTrainedModel):
+class BailingMoeV2_5Model(BailingMoeV2_5PreTrainedModel):
     """
-    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`BailingMoeLinearV2DecoderLayer`]
+    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`BailingMoeV2_5DecoderLayer`]
     Args:
-        config: BailingMoeLinearV2Config
+        config: BailingMoeV2_5Config
     """
 
-    def __init__(self, config: BailingMoeLinearV2Config):
+    def __init__(self, config: BailingMoeV2_5Config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -1391,15 +1217,16 @@ class BailingMoeLinearV2Model(BailingMoeV2PreTrainedModel):
         self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = []
         for layer_idx in range(config.num_hidden_layers + config.num_nextn_predict_layers):
-            layer_cls = BailingMoeLinearV2DecoderLayer if layer_idx < config.num_hidden_layers else BailingMoeV2MTPLayer
+            layer_cls = BailingMoeV2_5DecoderLayer if layer_idx < config.num_hidden_layers else BailingMoeV2_5MTPLayer
             self.layers.append(layer_cls(config, layer_idx))
 
         self.layers = nn.ModuleList(self.layers)
 
         self._use_sdpa = config._attn_implementation == "sdpa"
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
-        self.norm = BailingMoeV2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = BailingMoeV2RotaryEmbedding(config=config)
+        self.norm = BailingMoeV2_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = BailingMoeV2_5RotaryEmbedding(config=config)
+        self.rotary_emb_mla = BailingMoeV2_5MLARotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
@@ -1410,7 +1237,7 @@ class BailingMoeLinearV2Model(BailingMoeV2PreTrainedModel):
     def set_input_embeddings(self, value):
         self.word_embeddings = value
 
-    @add_start_docstrings_to_model_forward(BAILINGMOEV2_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(BAILINGMOEV2_5_INPUTS_DOCSTRING)
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1418,13 +1245,14 @@ class BailingMoeLinearV2Model(BailingMoeV2PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         **kwargs,
-    ) -> Union[Tuple, MoeV2ModelOutputWithPast]:
+    ) -> Union[Tuple, MoeV2_5ModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1459,14 +1287,21 @@ class BailingMoeLinearV2Model(BailingMoeV2PreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
 
+        # For hybrid attention (MLA + Linear Attention), use the softmax attention layer's cache length
+        # to ensure consistent position tracking across different attention types
         softmax_attention_layer_id = self.config.layer_group_size - 1
-        past_seen_tokens = past_key_values.get_seq_length(layer_idx=softmax_attention_layer_id) if past_key_values is not None else 0
+        if past_key_values is not None:
+            past_seen_tokens = past_key_values.get_seq_length(layer_idx=softmax_attention_layer_id)
+        else:
+            past_seen_tokens = 0
 
-        if position_ids is None:
-            position_ids = torch.arange(
+        if cache_position is None:
+            cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
-            position_ids = position_ids.unsqueeze(0)
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
 
         if self._use_flash_attention_2:
             # 2d mask is passed through the layers
@@ -1491,6 +1326,7 @@ class BailingMoeLinearV2Model(BailingMoeV2PreTrainedModel):
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings_mla = self.rotary_emb_mla(hidden_states, position_ids)
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -1499,6 +1335,8 @@ class BailingMoeLinearV2Model(BailingMoeV2PreTrainedModel):
         next_decoder_cache = None
         layers = self.layers[: -self.num_nextn_predict_layers] if self.num_nextn_predict_layers > 0 else self.layers
         mtp_layers = self.layers[-self.num_nextn_predict_layers :] if self.num_nextn_predict_layers > 0 else None
+
+        # tptest miss causal_mask = create_causal_mask(
 
         for decoder_layer in layers:
             if output_hidden_states:
@@ -1511,10 +1349,12 @@ class BailingMoeLinearV2Model(BailingMoeV2PreTrainedModel):
                     attention_mask,
                     position_ids,
                     past_key_values,
+                    cache_position,
                     output_attentions,
                     output_router_logits,
                     use_cache,
                     position_embeddings,
+                    position_embeddings_mla,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1522,10 +1362,12 @@ class BailingMoeLinearV2Model(BailingMoeV2PreTrainedModel):
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
+                    cache_position=cache_position,
                     output_attentions=output_attentions,
                     output_router_logits=output_router_logits,
                     use_cache=use_cache,
                     position_embeddings=position_embeddings,
+                    position_embeddings_mla=position_embeddings_mla,
                 )
             hidden_states = layer_outputs[0]
 
@@ -1547,7 +1389,8 @@ class BailingMoeLinearV2Model(BailingMoeV2PreTrainedModel):
 
         mtp_hidden_states = None
 
-        if mtp_layers:
+        # MTP layers are only used during training, skip them during inference
+        if mtp_layers and self.training:
             for decoder_layer in mtp_layers:
                 input_ids, _ = roll_tensor(input_ids, shifts=-1, dims=-1)
                 inputs_embeds = self.word_embeddings(input_ids)
@@ -1603,7 +1446,7 @@ class BailingMoeLinearV2Model(BailingMoeV2PreTrainedModel):
                 for v in [main_hidden_states, next_cache, all_hidden_states, all_self_attns, all_router_logits]
                 if v is not None
             )
-        return MoeV2ModelOutputWithPast(
+        return MoeV2_5ModelOutputWithPast(
             last_hidden_state=main_hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
@@ -1613,12 +1456,12 @@ class BailingMoeLinearV2Model(BailingMoeV2PreTrainedModel):
         )
 
 
-class BailingMoeLinearV2ForCausalLM(BailingMoeV2PreTrainedModel, GenerationMixin):
+class BailingMoeV2_5ForCausalLM(BailingMoeV2_5PreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config: BailingMoeLinearV2Config):
+    def __init__(self, config: BailingMoeV2_5Config):
         super().__init__(config)
-        self.model = BailingMoeLinearV2Model(config)
+        self.model = BailingMoeV2_5Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.num_nextn_predict_layers = config.num_nextn_predict_layers
@@ -1645,8 +1488,8 @@ class BailingMoeLinearV2ForCausalLM(BailingMoeV2PreTrainedModel, GenerationMixin
     def get_decoder(self):
         return self.model
 
-    @add_start_docstrings_to_model_forward(BAILINGMOEV2_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=MoEV2CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
+    @add_start_docstrings_to_model_forward(BAILINGMOEV2_5_INPUTS_DOCSTRING)
+    @replace_return_docstrings(output_type=MoEV2_5CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1661,7 +1504,7 @@ class BailingMoeLinearV2ForCausalLM(BailingMoeV2PreTrainedModel, GenerationMixin
         output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         **kwargs,
-    ) -> Union[Tuple, MoEV2CausalLMOutputWithPast]:
+    ) -> Union[Tuple, MoEV2_5CausalLMOutputWithPast]:
         r"""
         Args:
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1672,7 +1515,7 @@ class BailingMoeLinearV2ForCausalLM(BailingMoeV2PreTrainedModel, GenerationMixin
         Example:
         ```python
         >>> from transformers import AutoTokenizer
-        >>> model = BailingMoeLinearV2ForCausalLM.from_pretrained(PATH_TO_CONVERTED_WEIGHTS)
+        >>> model = BailingMoeV2_5ForCausalLM.from_pretrained(PATH_TO_CONVERTED_WEIGHTS)
         >>> tokenizer = AutoTokenizer.from_pretrained(PATH_TO_CONVERTED_TOKENIZER)
         >>> prompt = "Hey, are you conscious? Can you talk to me?"
         >>> inputs = tokenizer(prompt, return_tensors="pt")
@@ -1715,7 +1558,7 @@ class BailingMoeLinearV2ForCausalLM(BailingMoeV2PreTrainedModel, GenerationMixin
             loss = self.loss_function(logits, labels, self.config.vocab_size, **kwargs)
 
         all_mtp_logits = None
-        if self.num_nextn_predict_layers > 0:
+        if self.num_nextn_predict_layers > 0 and outputs.mtp_hidden_states is not None:
             mtp_hidden_states = outputs.mtp_hidden_states
             shift_labels_mtp = None
             for i in range(self.num_nextn_predict_layers):
@@ -1729,7 +1572,9 @@ class BailingMoeLinearV2ForCausalLM(BailingMoeV2PreTrainedModel, GenerationMixin
                         shift_labels_mtp = labels.clone()
                     shift_labels_mtp, _ = roll_tensor(shift_labels_mtp, shifts=-1, dims=-1, fill_value=-100)
                     mtp_logits_ = mtp_logits.view(-1, self.config.vocab_size)
-                    mtp_loss = self.loss_function(mtp_logits_, shift_labels_mtp.to(mtp_logits_.device).view(-1), self.config.vocab_size, **kwargs)
+                    mtp_loss = self.loss_function(
+                        mtp_logits_, shift_labels_mtp.to(mtp_logits_.device).view(-1), self.config.vocab_size, **kwargs
+                    )
                     if loss is not None:
                         loss += self.mtp_loss_scaling_factor * mtp_loss
                     else:
@@ -1745,7 +1590,7 @@ class BailingMoeLinearV2ForCausalLM(BailingMoeV2PreTrainedModel, GenerationMixin
                 output = (aux_loss,) + output
             return (loss,) + output if loss is not None else output
 
-        return MoEV2CausalLMOutputWithPast(
+        return MoEV2_5CausalLMOutputWithPast(
             loss=loss,
             mtp_loss=all_mtp_loss,
             aux_loss=aux_loss,
