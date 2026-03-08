@@ -20,6 +20,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.group_rms_norm import GroupRMSNorm
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+from megatron.core.utils import get_pg_rank
 
 # Import GLA operators
 try:
@@ -100,11 +101,12 @@ class LinearAttention(Attention):
         # Register slope as buffer (non-persistent, will be recomputed)
         self.register_buffer('slope', slope, persistent=False)
 
-        # Initialize GroupRMSNorm for gating
-        # Note: hidden_size is set to num_heads * kv_channels to match the gating dimension
-        # after g_proj projection, not the model's hidden_size
+        # MEG-2: Initialize GroupRMSNorm with TP-local size
+        # g_proj uses gather_output=False, so its output and attn_output are TP-local.
+        # g_norm must match the TP-local dimension (num_heads_per_partition * kv_channels).
+        local_gate_size = self.num_attention_heads_per_partition * config.kv_channels
         self.g_norm = GroupRMSNorm(
-            hidden_size=config.num_attention_heads * config.kv_channels,
+            hidden_size=local_gate_size,
             group_norm_size=config.linear_attn_norm_group_size,
             eps=config.layernorm_epsilon,
             sequence_parallel=config.sequence_parallel,
@@ -159,6 +161,18 @@ class LinearAttention(Attention):
             )
         else:
             self.k_layernorm = None
+
+    def backward_dw(self) -> None:
+        """Execute weight update operations for all projections.
+
+        MEG-6: LinearAttention inherits from Attention (which has no backward_dw),
+        not SelfAttention. We explicitly call backward_dw on each projection to
+        ensure g_proj participates in the delayed-wgrad path alongside linear_qkv
+        and linear_proj.
+        """
+        self.linear_qkv.backward_dw()
+        self.linear_proj.backward_dw()
+        self.g_proj.backward_dw()
 
     @staticmethod
     def _build_slope_tensor(n_attention_heads: int) -> Tensor:
@@ -311,11 +325,18 @@ class LinearAttention(Attention):
         if inference_params is not None and inference_context is None:
             inference_context = inference_params
 
-        # Validate attention mask - LinearAttention only supports 2D masks
-        if attention_mask is not None and attention_mask.dim() == 4:
+        # MEG-1: Validate attention mask - LinearAttention only supports 2D padding masks
+        if attention_mask is not None and attention_mask.dim() != 2:
             raise ValueError(
-                "LinearAttention does not support 4D causal attention masks. "
-                "Please use 2D attention masks only."
+                f"LinearAttention only supports 2D padding masks of shape [batch, seq_len], "
+                f"got {attention_mask.dim()}D mask with shape {attention_mask.shape}."
+            )
+
+        # MEG-5: Reject packed sequences - not implemented for LinearAttention
+        if packed_seq_params is not None:
+            raise NotImplementedError(
+                "LinearAttention does not support packed sequences (THD format). "
+                "Please use unpacked sequences."
             )
 
         # Get sequence length for mode selection
@@ -394,18 +415,20 @@ class LinearAttention(Attention):
         q = q.view(sq, b, -1)
         k = k.view(sq, b, -1)
 
-        # Reshape Q, K, V for GLA kernel
-        # Megatron format: [sq, b, num_heads * head_dim]
-        # GLA format: [b, sq, num_heads, head_dim]
+        # MEG-2: Reshape Q, K, V for GLA kernel using TP-local head counts
+        # QKV tensors are already TP-sharded (gather_output=False), so we must use
+        # partition-local head counts end-to-end to avoid shape mismatches under TP > 1.
+        # Megatron format: [sq, b, num_heads_local * head_dim]
+        # GLA format: [b, sq, num_heads_local, head_dim]
         sq, b = q.size(0), q.size(1)
-        num_heads = self.config.num_attention_heads
-        num_kv_heads = self.config.num_query_groups
-        head_dim = self.config.kv_channels
+        num_heads = self.num_attention_heads_per_partition
+        num_kv_heads = self.num_query_groups_per_partition
+        head_dim = self.hidden_size_per_attention_head
 
-        # Reshape Q: [sq, b, num_heads * head_dim] -> [b, sq, num_heads, head_dim]
+        # Reshape Q: [sq, b, num_heads_local * head_dim] -> [b, sq, num_heads_local, head_dim]
         q = q.view(sq, b, num_heads, head_dim).transpose(0, 1).contiguous()
 
-        # Reshape K, V: [sq, b, num_kv_heads * head_dim] -> [b, sq, num_kv_heads, head_dim]
+        # Reshape K, V: [sq, b, num_kv_heads_local * head_dim] -> [b, sq, num_kv_heads_local, head_dim]
         k = k.view(sq, b, num_kv_heads, head_dim).transpose(0, 1).contiguous()
         v = v.view(sq, b, num_kv_heads, head_dim).transpose(0, 1).contiguous()
 
@@ -461,8 +484,13 @@ class LinearAttention(Attention):
         # Apply GLA kernel
         gla_fn = self.gla_ops[mode]
 
-        # Prepare slope tensor: [num_heads] -> [b, sq, num_heads]
-        slope_expanded = self.slope[None, None, :].expand(b, sq, num_heads)
+        # MEG-2: Slice slope to TP-local partition
+        # self.slope has shape [global_num_heads], slice to local heads for this TP rank
+        # Use get_pg_rank with pg_collection.tp for safe fallback (returns 0 when
+        # distributed is not initialized or group is None).
+        tp_rank = get_pg_rank(self.pg_collection.tp)
+        local_slope = self.slope[tp_rank * num_heads : (tp_rank + 1) * num_heads]
+        slope_expanded = local_slope[None, None, :].expand(b, sq, num_heads)
 
         # Call GLA kernel
         # Returns: (output, recurrent_state)
