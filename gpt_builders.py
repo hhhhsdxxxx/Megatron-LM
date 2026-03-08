@@ -71,7 +71,18 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
         mtp_block_spec = None
         if args.mtp_num_layers is not None:
             assert not (config.transformer_impl == "inference_optimized")
-            if (
+            if args.spec is not None:
+                # Custom spec: pass the block spec directly to MTP builder.
+                # get_gpt_mtp_block_spec extracts the last layer from it.
+                # Guard against empty layer_specs on non-last PP stages.
+                if (
+                    hasattr(transformer_layer_spec, 'layer_specs')
+                    and len(transformer_layer_spec.layer_specs) == 0
+                ):
+                    transformer_layer_spec_for_mtp = _get_transformer_layer_spec(use_te, config)
+                else:
+                    transformer_layer_spec_for_mtp = transformer_layer_spec
+            elif (
                 hasattr(transformer_layer_spec, 'layer_specs')
                 and len(transformer_layer_spec.layer_specs) == 0
             ):

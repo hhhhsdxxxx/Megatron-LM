@@ -109,6 +109,7 @@ GPT_MODEL_ARGS=(
     --position-embedding-type rope
     --rotary-base 10000
     --rotary-percent 0.5
+    --rotary-interleaved
     --max-position-embeddings 4096
 
     # Normalization
@@ -143,11 +144,21 @@ LINEAR_ATTN_ARGS=(
 )
 
 # ============================================================================
+# Multi-Latent Attention (MLA) Configuration
+# ============================================================================
+# Standard attention layers (every 5th layer) use MLA instead of vanilla MHA
+MLA_ARGS=(
+    --multi-latent-attention
+    --q-lora-rank 1536
+    --kv-lora-rank 512
+    --qk-head-dim 128
+    --qk-pos-emb-head-dim 64
+    --v-head-dim 128
+)
+
+# ============================================================================
 # MoE Configuration
 # ============================================================================
-# NOTE: Current implementation uses standard TopK router
-# Group-limited TopK router from reference is not yet implemented
-# See IMPLEMENTATION_DIFFERENCES.md for details
 MOE_ARGS=(
     --num-experts 256
     --expert-model-parallel-size 8
@@ -157,9 +168,14 @@ MOE_ARGS=(
     --moe-token-dispatcher-type flex
     --moe-grouped-gemm
 
-    # Router configuration
+    # Router configuration (group-limited TopK, matching reference BailingMoeV2_5Gate)
     --moe-router-load-balancing-type aux_loss
     --moe-aux-loss-coeff 0.0000035
+    --moe-router-score-function sigmoid
+    --moe-router-num-groups 8
+    --moe-router-group-topk 4
+    --moe-router-enable-expert-bias
+    --moe-router-topk-scaling-factor 2.5
 
     # Expert configuration
     --moe-ffn-hidden-size 512
@@ -173,12 +189,11 @@ MOE_ARGS=(
 # ============================================================================
 # Multi-Token Prediction (MTP) Configuration
 # ============================================================================
-# NOTE: MTP layers are not yet implemented in current Megatron-LM
-# These arguments are placeholders for future implementation
-# MTP_ARGS=(
-#     --mtp-num-layers 1
-#     --mtp-loss-scaling-factor 0.1
-# )
+MTP_ARGS=(
+    --mtp-num-layers 1
+    --mtp-loss-scaling-factor 0.1
+    --mtp-loss-scaling-per-layer
+)
 
 # ============================================================================
 # Training Configuration
@@ -294,7 +309,9 @@ KERNEL_ARGS=(
 CMD="${LAUNCHER} pretrain_gpt.py \
     ${GPT_MODEL_ARGS[@]} \
     ${LINEAR_ATTN_ARGS[@]} \
+    ${MLA_ARGS[@]} \
     ${MOE_ARGS[@]} \
+    ${MTP_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${DATA_ARGS[@]} \

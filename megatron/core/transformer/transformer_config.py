@@ -60,10 +60,16 @@ class TransformerConfig(ModelParallelConfig):
 
     mtp_loss_scaling_factor: Optional[float] = 0.1
     """Weighting factor of Multi-Token Prediction (MTP) loss.
-    We compute the average of the MTP losses across all depths, 
-    and multiply it the scaling factor to obtain the overall MTP loss, 
+    We compute the average of the MTP losses across all depths,
+    and multiply it the scaling factor to obtain the overall MTP loss,
     which serves as an additional training objective.
     """
+
+    mtp_loss_scaling_per_layer: bool = False
+    """When True, each MTP layer's loss is scaled by mtp_loss_scaling_factor directly,
+    without dividing by mtp_num_layers. This matches the BailingMoE reference behavior.
+    When False (default), the scaling factor is divided by mtp_num_layers to compute
+    the average MTP loss across all depths."""
 
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
@@ -1694,8 +1700,6 @@ class TransformerConfig(ModelParallelConfig):
             if self.attention_output_gate:
                 raise ValueError("fused_single_qkv_rope does not support gated attention for now.")
 
-        if self.multi_latent_attention and self.rotary_interleaved:
-            raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
 
         # MuP (Maximal Update Parameterization) configuration
         if self.use_mup:

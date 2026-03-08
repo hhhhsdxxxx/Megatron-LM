@@ -1,17 +1,21 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Layer specifications for BailingMoE Linear V2 with custom MTP layer."""
+"""Layer specifications for BailingMoE Linear V2 hybrid architecture."""
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_linear_attention_pattern,
+    get_moe_layer_pattern,
+)
 from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec_for_backend
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
-from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.linear_attention import LinearAttention
-from megatron.core.transformer.multi_token_prediction import (
-    MultiTokenPredictionLayer,
-    MultiTokenPredictionLayerSubmodules,
+from megatron.core.transformer.multi_latent_attention import (
+    MLASelfAttention,
+    MLASelfAttentionSubmodules,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
@@ -19,80 +23,29 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 
-def get_bailing_moe_v2_mtp_layer_submodules(
-    backend: BackendSpecProvider, mtp_model_layer_spec: ModuleSpec
-) -> MultiTokenPredictionLayerSubmodules:
-    """
-    Get MTP layer submodules for BailingMoE Linear V2.
-
-    This is a custom implementation that adds final_layernorm to match the
-    reference BailingMoE Linear V2 implementation.
-
-    Args:
-        backend: Backend specification provider (TE or Local)
-        mtp_model_layer_spec: Specification for the transformer layer
-
-    Returns:
-        MultiTokenPredictionLayerSubmodules with final_layernorm added
-    """
-    layer_norm_impl = backend.layer_norm()
-
-    return MultiTokenPredictionLayerSubmodules(
-        enorm=layer_norm_impl,
-        hnorm=layer_norm_impl,
-        eh_proj=backend.column_parallel_linear(),
-        mtp_model_layer=mtp_model_layer_spec,
-        layer_norm=layer_norm_impl,  # This is the final_layernorm
-    )
-
-
-def get_bailing_moe_v2_mtp_layer_spec(
-    backend: BackendSpecProvider, mtp_model_layer_spec: ModuleSpec
-) -> ModuleSpec:
-    """
-    Get MTP layer spec for BailingMoE Linear V2.
-
-    Args:
-        backend: Backend specification provider (TE or Local)
-        mtp_model_layer_spec: Specification for the transformer layer
-
-    Returns:
-        ModuleSpec for MultiTokenPredictionLayer with custom submodules
-    """
-    return ModuleSpec(
-        module=MultiTokenPredictionLayer,
-        submodules=get_bailing_moe_v2_mtp_layer_submodules(backend, mtp_model_layer_spec),
-    )
-
-
 def get_bailing_moe_linear_v2_layer_spec(
-    backend: BackendSpecProvider, layer_idx: int, config: TransformerConfig
+    backend: BackendSpecProvider,
+    config: TransformerConfig,
+    use_linear_attention: bool,
+    use_moe: bool,
+    use_te: bool,
 ) -> TransformerLayerSubmodules:
     """
     Get layer spec for BailingMoE Linear V2 with hybrid architecture.
 
-    This function determines the layer type based on layer_idx:
-    - Attention: Linear Attention for layers 0-3, 5-8, 10-13, 15-18
-                 Standard Attention for layers 4, 9, 14, 19
-    - MLP: Dense MLP for layer 0, MoE for layers 1-19
+    Attention and MLP types are determined by the caller based on
+    config.linear_attention_freq and config.moe_layer_freq patterns.
 
     Args:
         backend: Backend specification provider (TE or Local)
-        layer_idx: Layer index (0-based)
         config: Transformer configuration
+        use_linear_attention: Whether this layer uses Linear Attention (vs MLA)
+        use_moe: Whether this layer uses MoE (vs Dense MLP)
+        use_te: Whether to use Transformer Engine backend
 
     Returns:
         TransformerLayerSubmodules with appropriate specs for this layer
     """
-    # Determine attention type based on layer_group_size=5 pattern
-    # Layers 0-3, 5-8, 10-13, 15-18: Linear Attention
-    # Layers 4, 9, 14, 19: Standard Attention
-    use_linear_attention = (layer_idx + 1) % 5 != 0
-
-    # Determine MLP type
-    # Layer 0: Dense MLP
-    # Layers 1-19: MoE
-    use_moe = layer_idx >= 1
 
     # Get layer norm
     layer_norm = backend.layer_norm()
@@ -114,18 +67,47 @@ def get_bailing_moe_linear_v2_layer_spec(
             ),
         )
     else:
-        # Standard Attention
-        attention_spec = ModuleSpec(
-            module=SelfAttention,
-            params={"attn_mask_type": AttnMaskType.causal},
-            submodules=SelfAttentionSubmodules(
-                linear_qkv=backend.column_parallel_linear(),
-                core_attention=backend.core_attention(),
-                linear_proj=backend.row_parallel_linear(),
-                q_layernorm=qk_layer_norm,
-                k_layernorm=qk_layer_norm,
-            ),
-        )
+        # MLA (Multi-Latent Attention)
+        if use_te:
+            # TE backend: down_proj uses non-parallel linear, layernorms fused into up_proj
+            up_proj = (
+                backend.column_parallel_layer_norm_linear()
+                if config.qk_layernorm
+                else backend.column_parallel_linear()
+            )
+            attention_spec = ModuleSpec(
+                module=MLASelfAttention,
+                params={"attn_mask_type": AttnMaskType.causal},
+                submodules=MLASelfAttentionSubmodules(
+                    linear_q_proj=backend.column_parallel_linear(),
+                    linear_q_down_proj=backend.linear(),
+                    linear_q_up_proj=up_proj,
+                    linear_kv_down_proj=backend.linear(),
+                    linear_kv_up_proj=up_proj,
+                    core_attention=backend.core_attention(),
+                    linear_proj=backend.row_parallel_linear(),
+                    q_layernorm=IdentityOp,
+                    kv_layernorm=IdentityOp,
+                ),
+            )
+        else:
+            # Local backend: all linears are column_parallel, explicit layernorms
+            mla_layernorm = backend.layer_norm(for_qk=True) if config.qk_layernorm else IdentityOp
+            attention_spec = ModuleSpec(
+                module=MLASelfAttention,
+                params={"attn_mask_type": AttnMaskType.causal},
+                submodules=MLASelfAttentionSubmodules(
+                    linear_q_proj=backend.column_parallel_linear(),
+                    linear_q_down_proj=backend.column_parallel_linear(),
+                    linear_q_up_proj=backend.column_parallel_linear(),
+                    linear_kv_down_proj=backend.column_parallel_linear(),
+                    linear_kv_up_proj=backend.column_parallel_linear(),
+                    core_attention=backend.core_attention(),
+                    linear_proj=backend.row_parallel_linear(),
+                    q_layernorm=mla_layernorm,
+                    kv_layernorm=mla_layernorm,
+                ),
+            )
 
     # Build MLP spec
     if use_moe:
@@ -157,8 +139,15 @@ def bailing_moe_linear_v2_block_spec(
     Block spec factory for BailingMoE Linear V2, referenced via --spec argument.
 
     Called by gpt_builders.py with config when --spec points to this function.
-    Follows the same pattern as get_gpt_decoder_block_spec: builds per-layer specs,
+    Builds per-layer specs with hybrid Linear Attention / MLA and Dense / MoE,
     slices for pipeline parallelism, and returns TransformerBlockSubmodules.
+
+    MTP handling: gpt_builders.py passes this block spec to get_gpt_mtp_block_spec,
+    which extracts the last decoder layer (MLA + MoE) as the MTP model layer.
+
+    The layer architecture is determined by config parameters:
+    - config.linear_attention_freq: Controls which layers use Linear Attention vs MLA
+    - config.moe_layer_freq: Controls which layers use MoE vs Dense MLP
 
     Args:
         config: Transformer configuration
@@ -180,11 +169,21 @@ def bailing_moe_linear_v2_block_spec(
     else:
         backend = LocalSpecProvider()
 
+    # Compute per-layer patterns from config
+    la_pattern = get_linear_attention_pattern(config)
+    moe_pattern = get_moe_layer_pattern(config)
+
     # Build layer specs list for all layers
     layer_specs = [
         ModuleSpec(
             module=TransformerLayer,
-            submodules=get_bailing_moe_linear_v2_layer_spec(backend, layer_idx, config),
+            submodules=get_bailing_moe_linear_v2_layer_spec(
+                backend,
+                config,
+                use_linear_attention=bool(la_pattern[layer_idx]),
+                use_moe=bool(moe_pattern[layer_idx]),
+                use_te=use_te,
+            ),
         )
         for layer_idx in range(config.num_layers)
     ]
