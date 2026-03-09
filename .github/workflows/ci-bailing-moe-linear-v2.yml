@@ -22,7 +22,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install flash-linear-attention
-        run: pip install flash-linear-attention
+        run: pip install --break-system-packages flash-linear-attention
 
       - name: Run BailingMoE Linear V2 pretraining (10 steps)
         env:
