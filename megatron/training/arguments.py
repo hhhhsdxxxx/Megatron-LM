@@ -1932,6 +1932,15 @@ def _add_network_size_args(parser):
         "persist_layer_norm",
         "bias_dropout_fusion",
         "apply_rope_fusion",
+        # registered by _add_mla_args
+        "q_lora_rank",
+        "kv_lora_rank",
+        "qk_head_dim",
+        "qk_pos_emb_head_dim",
+        "v_head_dim",
+        "rotary_scaling_factor",
+        "mscale",
+        "mscale_all_dim",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")

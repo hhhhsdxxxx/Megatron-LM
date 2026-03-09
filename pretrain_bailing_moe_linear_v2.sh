@@ -149,6 +149,7 @@ GPT_MODEL_ARGS=(
     --position-embedding-type rope
     --rotary-base 10000
     --rotary-percent 0.5
+    --rotary-interleaved
     --max-position-embeddings 4096
 
     # Normalization
@@ -163,6 +164,13 @@ GPT_MODEL_ARGS=(
     --vocab-size 157184
     --make-vocab-size-divisible-by 128
     --untie-embeddings-and-output-weights
+
+    # MLA dimension args (for hybrid Linear Attention + MLA layers)
+    --q-lora-rank 1536
+    --kv-lora-rank 512
+    --qk-head-dim 128
+    --qk-pos-emb-head-dim 64
+    --v-head-dim 128
 
     # Implementation
     --transformer-impl transformer_engine
@@ -221,6 +229,7 @@ MOE_ARGS=(
 MTP_ARGS=(
     --mtp-num-layers 1
     --mtp-loss-scaling-factor 0.1
+    --mtp-loss-scaling-per-layer
 )
 
 # ============================================================================

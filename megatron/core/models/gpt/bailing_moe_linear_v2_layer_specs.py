@@ -198,6 +198,24 @@ def bailing_moe_linear_v2_block_spec(
     la_pattern = get_linear_attention_pattern(config)
     moe_pattern = get_moe_layer_pattern(config)
 
+    # Validate MLA dimension fields are set when pattern includes MLA layers.
+    # Note: q_lora_rank is intentionally excluded — MLASelfAttention supports
+    # q_lora_rank=None (direct query projection without LoRA).
+    if any(not la_pattern[i] for i in range(config.num_layers)):
+        required_mla_fields = {
+            "kv_lora_rank": "--kv-lora-rank",
+            "qk_head_dim": "--qk-head-dim",
+            "qk_pos_emb_head_dim": "--qk-pos-emb-head-dim",
+            "v_head_dim": "--v-head-dim",
+        }
+        missing = [
+            arg for field, arg in required_mla_fields.items() if getattr(config, field) is None
+        ]
+        assert not missing, (
+            "MLA layers are present but required dimension fields are missing. "
+            f"Please provide: {', '.join(missing)}"
+        )
+
     # Build layer specs list for all layers
     layer_specs = [
         ModuleSpec(

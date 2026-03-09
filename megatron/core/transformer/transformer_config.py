@@ -277,6 +277,30 @@ class TransformerConfig(ModelParallelConfig):
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
 
+    q_lora_rank: Optional[int] = None
+    """Rank of Query tensor's low rank representation (MLA). None means MLA dims not configured."""
+
+    kv_lora_rank: Optional[int] = None
+    """Rank of Key and Value tensors' low rank representation (MLA). None means MLA dims not configured."""
+
+    qk_head_dim: Optional[int] = None
+    """Dimension of the head in the QK projection (MLA). q_head_dim = qk_head_dim + qk_pos_emb_head_dim."""
+
+    qk_pos_emb_head_dim: Optional[int] = None
+    """Dimension of the position embedding in the QK projection (MLA)."""
+
+    v_head_dim: Optional[int] = None
+    """Dimension of the head in the V projection (MLA)."""
+
+    rotary_scaling_factor: float = 1.0
+    """Rotary scaling factor for the rotary embeddings."""
+
+    mscale: float = 1.0
+    """Mscale for YaRN RoPE in Multi-Latent Attention."""
+
+    mscale_all_dim: float = 0.0
+    """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention."""
+
     no_rope_freq: Optional[Union[int, List[int]]] = None
     """Controls which layers perform Rotary Position Embedding (RoPE). Accepts either:
     An integer N: Creates a pattern where RoPE is skipped every N-1 layers. For example,

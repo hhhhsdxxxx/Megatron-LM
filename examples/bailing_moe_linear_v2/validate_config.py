@@ -59,9 +59,20 @@ REFERENCE_PARAMS = {
     # Vocabulary
     "vocab_size": 157184,
 
+    # MLA Dimension Configuration
+    "q_lora_rank": 1536,
+    "kv_lora_rank": 512,
+    "qk_head_dim": 128,
+    "qk_pos_emb_head_dim": 64,
+    "v_head_dim": 128,
+
+    # Position Embedding Configuration
+    "rotary_interleaved": True,
+
     # MTP Configuration
     "num_nextn_predict_layers": 1,
     "mtp_loss_scaling_factor": 0.1,
+    "mtp_loss_scaling_per_layer": True,
 
     # Training Configuration
     "micro_batch_size": 2,
@@ -134,6 +145,13 @@ def extract_script_params(script_path: Path) -> Dict[str, Any]:
         # Vocabulary
         "vocab_size": r"--vocab-size\s+(\d+)",
 
+        # MLA Dimension Configuration
+        "q_lora_rank": r"--q-lora-rank\s+(\d+)",
+        "kv_lora_rank": r"--kv-lora-rank\s+(\d+)",
+        "qk_head_dim": r"--qk-head-dim\s+(\d+)",
+        "qk_pos_emb_head_dim": r"--qk-pos-emb-head-dim\s+(\d+)",
+        "v_head_dim": r"--v-head-dim\s+(\d+)",
+
         # MTP Configuration
         "mtp_num_layers": r"--mtp-num-layers\s+(\d+)",
         "mtp_loss_scaling_factor": r"--mtp-loss-scaling-factor\s+([\d.]+)",
@@ -168,6 +186,8 @@ def extract_script_params(script_path: Path) -> Dict[str, Any]:
     # Check for boolean flags
     params["qk_layernorm"] = "--qk-layernorm" in content
     params["moe_router_enable_expert_bias"] = "--moe-router-enable-expert-bias" in content
+    params["rotary_interleaved"] = "--rotary-interleaved" in content
+    params["mtp_loss_scaling_per_layer"] = "--mtp-loss-scaling-per-layer" in content
 
     return params
 
@@ -222,9 +242,20 @@ def validate_parameters(script_params: Dict[str, Any]) -> Tuple[bool, List[str]]
         # Vocabulary
         "vocab_size": "vocab_size",
 
+        # MLA Dimension Configuration
+        "q_lora_rank": "q_lora_rank",
+        "kv_lora_rank": "kv_lora_rank",
+        "qk_head_dim": "qk_head_dim",
+        "qk_pos_emb_head_dim": "qk_pos_emb_head_dim",
+        "v_head_dim": "v_head_dim",
+
+        # Position Embedding Configuration
+        "rotary_interleaved": "rotary_interleaved",
+
         # MTP Configuration
         "mtp_num_layers": "num_nextn_predict_layers",
         "mtp_loss_scaling_factor": "mtp_loss_scaling_factor",
+        "mtp_loss_scaling_per_layer": "mtp_loss_scaling_per_layer",
 
         # Training Configuration
         "micro_batch_size": "micro_batch_size",
