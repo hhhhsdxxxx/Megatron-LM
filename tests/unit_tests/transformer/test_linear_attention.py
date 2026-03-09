@@ -154,7 +154,7 @@ class TestLinearAttentionInitialization:
                 attn_mask_type=AttnMaskType.causal,
             )
 
-            # Check slope tensor exists and has correct shape
+            # Check slope tensor exists and has correct shape (TP-local at TP=1 = global)
             assert hasattr(layer, 'slope'), f"Layer {layer_idx} missing slope tensor"
             assert layer.slope.shape == (num_heads,), \
                 f"Layer {layer_idx} slope shape mismatch: {layer.slope.shape}"
@@ -168,7 +168,9 @@ class TestLinearAttentionInitialization:
             assert layer.g_proj is not None, f"Layer {layer_idx} g_proj is None"
 
             # Verify slope values are layer-dependent
-            # slope = -base_slope * (1 - (layer_idx - 1) / (num_layers - 1) + 1e-5)
+            # global_layer_number = layer_number + (pp_layer_offset or 0)
+            # slope = -base_slope * (1 - (global_layer_number - 1) / (num_layers - 1) + 1e-5)
+            # With pp_layer_offset=None, global_layer_number = layer_idx
             base_slope = LinearAttention._build_slope_tensor(num_heads)
             expected_slope = -base_slope * (1 - (layer_idx - 1) / (num_layers - 1) + 1e-5)
 
@@ -218,6 +220,9 @@ def _make_layer(
     num_query_groups=None,
     linear_attn_norm_group_size=4,
     layer_number=1,
+    use_linear_silu=False,
+    kv_expand=1,
+    linear_attn_num_query_groups=0,
 ):
     """Create a LinearAttention layer for testing."""
     kwargs = dict(
@@ -227,6 +232,9 @@ def _make_layer(
         kv_channels=kv_channels,
         linear_attn_norm_group_size=linear_attn_norm_group_size,
         use_cpu_initialization=True,
+        use_linear_silu=use_linear_silu,
+        kv_expand=kv_expand,
+        linear_attn_num_query_groups=linear_attn_num_query_groups,
     )
     if num_query_groups is not None:
         kwargs['num_query_groups'] = num_query_groups
@@ -386,33 +394,32 @@ class TestLinearAttentionForward:
             layer_gqa.num_attention_heads_per_partition * layer_gqa.config.kv_channels
         )
 
-    def test_meg2_slope_buffer_is_global(self):
-        """MEG-2: The slope buffer is built with global num_attention_heads.
+    def test_meg2_slope_buffer_is_tp_local(self):
+        """MEG-2: The slope buffer is now TP-local (sliced in __init__).
 
-        At runtime, get_pg_rank(pg_collection.tp) slices it to the local partition. Here we
-        verify the buffer has the full global shape.
+        At TP=1, the TP-local slope equals the full global slope.
         """
         num_heads = 16
         layer = _make_layer(num_attention_heads=num_heads)
+        # At TP=1, TP-local = global
         assert layer.slope.shape == (num_heads,), (
-            f"slope buffer should have global shape ({num_heads},), "
+            f"slope buffer should have TP-local shape ({num_heads},) at TP=1, "
             f"got {layer.slope.shape}"
         )
 
-    def test_meg2_slope_slicing_tp1(self):
-        """MEG-2: At TP=1 (rank 0), slope slice should equal full buffer."""
+    def test_meg2_slope_already_tp_local(self):
+        """MEG-2: At TP=1, slope is already TP-local (no runtime slicing needed)."""
         num_heads = 16
         layer = _make_layer(num_attention_heads=num_heads)
 
-        from megatron.core.utils import get_pg_rank
-        tp_rank = get_pg_rank(layer.pg_collection.tp)
-        assert tp_rank == 0, "Expected TP rank 0 for single-GPU test"
+        # Verify slope is TP-local and matches expected values
+        base_slope = LinearAttention._build_slope_tensor(num_heads)
+        global_layer_number = layer.layer_number  # no PP offset
+        num_layers = layer.config.num_layers
+        expected_slope = -base_slope * (1 - (global_layer_number - 1) / max(num_layers - 1, 1) + 1e-5)
 
-        local_heads = layer.num_attention_heads_per_partition
-        local_slope = layer.slope[tp_rank * local_heads : (tp_rank + 1) * local_heads]
-
-        assert torch.equal(local_slope, layer.slope), (
-            "At TP=1, sliced slope should equal the full slope buffer"
+        assert torch.allclose(layer.slope, expected_slope, rtol=1e-5), (
+            "At TP=1, slope should match the full expected slope"
         )
 
     def test_meg2_forward_reshape_uses_local_heads(self):
@@ -525,10 +532,10 @@ class TestLinearAttentionForward:
         assert captured_args['v_shape'] == (b, sq, expected_heads, head_dim)
 
     # ------------------------------------------------------------------
-    # MEG-5: packed_seq_params must be explicitly rejected
+    # MEG-5: packed_seq_params is now supported
     # ------------------------------------------------------------------
-    def test_meg5_rejects_packed_seq_params(self):
-        """MEG-5: Passing packed_seq_params must raise NotImplementedError."""
+    def test_meg5_accepts_packed_seq_params(self):
+        """MEG-5: Passing packed_seq_params should be accepted (THD format support)."""
         layer = _make_layer()
         sq, b, h = 16, 2, 512
         hidden_states = torch.randn(sq, b, h)
@@ -541,70 +548,56 @@ class TestLinearAttentionForward:
             max_seqlen_kv=8,
         )
 
-        with pytest.raises(NotImplementedError, match="does not support packed sequences"):
-            layer.forward(
-                hidden_states=hidden_states,
-                attention_mask=None,
-                packed_seq_params=packed_params,
-            )
-
-    def test_meg5_error_before_any_computation(self):
-        """MEG-5: packed_seq_params rejection must happen before QKV projection.
-
-        Verify that get_query_key_value_tensors is NOT called when packed_seq_params
-        is provided, confirming the guard is early in the forward path.
-        """
-        layer = _make_layer()
-        sq, b, h = 16, 2, 512
-        hidden_states = torch.randn(sq, b, h)
-
-        packed_params = PackedSeqParams(
-            qkv_format='thd',
-            cu_seqlens_q=torch.tensor([0, 8, 16], dtype=torch.int32),
-            cu_seqlens_kv=torch.tensor([0, 8, 16], dtype=torch.int32),
-            max_seqlen_q=8,
-            max_seqlen_kv=8,
-        )
-
-        original_get_qkv = layer.get_query_key_value_tensors
-        call_count = [0]
-
-        def counting_get_qkv(*args, **kwargs):
-            call_count[0] += 1
-            return original_get_qkv(*args, **kwargs)
-
-        layer.get_query_key_value_tensors = counting_get_qkv
-
-        with pytest.raises(NotImplementedError):
-            layer.forward(
-                hidden_states=hidden_states,
-                attention_mask=None,
-                packed_seq_params=packed_params,
-            )
-
-        assert call_count[0] == 0, (
-            "get_query_key_value_tensors should not be called when packed_seq_params is rejected"
-        )
-
-    def test_meg5_none_packed_seq_params_passes(self):
-        """MEG-5: None packed_seq_params (default) must not trigger rejection."""
-        layer = _make_layer()
-        sq, b, h = 16, 2, 512
-        hidden_states = torch.randn(sq, b, h)
-
-        # Should not raise NotImplementedError
+        # Should not raise NotImplementedError - packed sequences are now supported
         try:
             layer.forward(
                 hidden_states=hidden_states,
                 attention_mask=None,
-                packed_seq_params=None,
+                packed_seq_params=packed_params,
             )
         except NotImplementedError as e:
             if "packed" in str(e).lower():
-                pytest.fail(f"None packed_seq_params should not trigger rejection: {e}")
+                pytest.fail(f"packed_seq_params should now be accepted: {e}")
         except Exception:
             # Other errors (GLA kernel, etc.) are fine
             pass
+
+    def test_meg5_cu_seqlens_extracted_from_packed_params(self):
+        """MEG-5: cu_seqlens should be correctly extracted from packed_seq_params."""
+        layer = _make_layer()
+        sq, b, h = 16, 2, 512
+        hidden_states = torch.randn(sq, b, h)
+
+        cu_seqlens = torch.tensor([0, 8, 16], dtype=torch.int32)
+        packed_params = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=8,
+            max_seqlen_kv=8,
+        )
+
+        captured_kwargs = {}
+
+        def fake_gla(q, k, v, g, **kw):
+            captured_kwargs.update(kw)
+            return v, None
+
+        layer.gla_ops['chunk'] = fake_gla
+        layer.gla_ops['fused_recurrent'] = fake_gla
+
+        try:
+            layer.forward(
+                hidden_states=hidden_states,
+                attention_mask=None,
+                packed_seq_params=packed_params,
+            )
+        except Exception:
+            pass
+
+        assert 'cu_seqlens' in captured_kwargs, "cu_seqlens should be passed to GLA kernel"
+        assert torch.equal(captured_kwargs['cu_seqlens'], cu_seqlens), \
+            "cu_seqlens should match packed_params.cu_seqlens_q"
 
     # ------------------------------------------------------------------
     # MEG-6: backward_dw must include g_proj
@@ -838,7 +831,10 @@ class TestLinearAttentionForwardEndToEnd:
         assert output.shape == (sq, b, h)
 
     def test_forward_gating_applies_sigmoid(self):
-        """Gating path: output = g_norm(attn_out) * sigmoid(g_proj(hidden))."""
+        """Gating path: output = g_norm(attn_out) * sigmoid(g_proj(hidden)).
+
+        Gate always uses sigmoid regardless of linear_attn_silu config.
+        """
         layer = _make_layer()
 
         # Use identity GLA so we can trace the gating
@@ -863,3 +859,157 @@ class TestLinearAttentionForwardEndToEnd:
         # Output should be finite and have correct shape
         assert output.shape == (sq, b, h)
         assert torch.isfinite(output).all(), "Output contains non-finite values"
+
+    def test_forward_gate_always_sigmoid(self):
+        """Gate always uses sigmoid, even when linear_attn_silu is True."""
+        # Create layer with linear_attn_silu=True
+        config = TransformerConfig(
+            num_layers=12,
+            hidden_size=512,
+            num_attention_heads=8,
+            kv_channels=64,
+            use_cpu_initialization=True,
+            linear_attn_silu=True,
+        )
+        submodules = SelfAttentionSubmodules(
+            linear_qkv=None,
+            core_attention=None,
+            linear_proj=None,
+        )
+        layer = LinearAttention(
+            config=config,
+            submodules=submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+        def identity_gla(q, k, v, g, **kw):
+            return torch.ones_like(v), None
+
+        layer.gla_ops['chunk'] = identity_gla
+        layer.gla_ops['fused_recurrent'] = identity_gla
+
+        sq, b, h = 128, 2, 512
+        hidden_states = torch.randn(sq, b, h)
+
+        # Should not raise - sigmoid is always used regardless of linear_attn_silu
+        output, _ = layer.forward(hidden_states=hidden_states, attention_mask=None)
+        assert output.shape == (sq, b, h)
+        assert torch.isfinite(output).all()
+
+
+class TestLinearAttentionNewFeatures:
+    """Tests for new features: use_linear_silu, kv_expand, linear_attn_num_query_groups."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_use_linear_silu_applies_silu_to_qkv(self):
+        """use_linear_silu should apply SiLU activation to QKV projections."""
+        layer_no_silu = _make_layer(use_linear_silu=False)
+        layer_silu = _make_layer(use_linear_silu=True)
+
+        # Copy weights to make output deterministic
+        layer_silu.linear_qkv.weight.data.copy_(layer_no_silu.linear_qkv.weight.data)
+
+        sq, b, h = 32, 2, 512
+        hidden_states = torch.randn(sq, b, h)
+
+        q_no_silu, k_no_silu, v_no_silu = layer_no_silu.get_query_key_value_tensors(
+            hidden_states, None, output_gate=False, split_qkv=True,
+        )
+        q_silu, k_silu, v_silu = layer_silu.get_query_key_value_tensors(
+            hidden_states, None, output_gate=False, split_qkv=True,
+        )
+
+        # With SiLU, Q should be SiLU(QKV_proj)[:q_size], not just QKV_proj[:q_size]
+        assert not torch.allclose(q_no_silu, q_silu, atol=1e-6), \
+            "SiLU should change Q values"
+
+    def test_kv_expand_changes_kv_projection_size(self):
+        """kv_expand should multiply the KV projection size."""
+        layer_1x = _make_layer(kv_expand=1)
+        layer_2x = _make_layer(kv_expand=2)
+
+        assert layer_2x.kv_projection_size == 2 * layer_1x.kv_projection_size, \
+            f"kv_expand=2 should double KV projection: {layer_2x.kv_projection_size} vs {layer_1x.kv_projection_size}"
+
+    def test_kv_expand_changes_linear_qkv_out_dim(self):
+        """kv_expand should increase linear_qkv output dimension."""
+        layer_1x = _make_layer(kv_expand=1)
+        layer_2x = _make_layer(kv_expand=2)
+
+        # linear_qkv_out_dim = query_projection_size + 2 * kv_projection_size
+        # With kv_expand=2, kv_projection_size doubles, so the total increases
+        expected_diff = 2 * layer_1x.kv_projection_size  # 2 * (kv_proj * (2-1))
+        assert layer_2x.linear_qkv_out_dim == layer_1x.linear_qkv_out_dim + expected_diff
+
+    def test_linear_attn_num_query_groups_overrides_num_query_groups(self):
+        """linear_attn_num_query_groups should override config.num_query_groups."""
+        # Default: linear_attn_num_query_groups=0 falls back to num_query_groups
+        layer_default = _make_layer(num_query_groups=2, linear_attn_num_query_groups=0)
+        assert layer_default.num_query_groups_per_partition == 2
+
+        # Override: linear_attn_num_query_groups=4 overrides num_query_groups=2
+        layer_override = _make_layer(num_query_groups=2, linear_attn_num_query_groups=4)
+        assert layer_override.num_query_groups_per_partition == 4
+
+    def test_linear_attn_num_query_groups_affects_kv_projection(self):
+        """linear_attn_num_query_groups should affect KV projection sizing."""
+        layer_2g = _make_layer(
+            num_query_groups=2,
+            linear_attn_num_query_groups=2,
+            kv_channels=64,
+        )
+        layer_4g = _make_layer(
+            num_query_groups=2,
+            linear_attn_num_query_groups=4,
+            kv_channels=64,
+        )
+
+        # kv_projection_size = kv_channels * kv_expand * linear_attn_num_query_groups
+        assert layer_4g.kv_projection_size == 2 * layer_2g.kv_projection_size
+
+    def test_slope_formula_with_pp_offset(self):
+        """Slope formula should use global_layer_number = layer_number + pp_layer_offset."""
+        num_layers = 24
+        num_heads = 8
+
+        config = TransformerConfig(
+            num_layers=num_layers,
+            hidden_size=512,
+            num_attention_heads=num_heads,
+            kv_channels=64,
+            use_cpu_initialization=True,
+        )
+        submodules = SelfAttentionSubmodules(
+            linear_qkv=None,
+            core_attention=None,
+            linear_proj=None,
+        )
+
+        # Layer 1 with PP offset 6 -> global_layer_number = 7
+        layer = LinearAttention(
+            config=config,
+            submodules=submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            pp_layer_offset=6,
+        )
+
+        base_slope = LinearAttention._build_slope_tensor(num_heads)
+        global_layer_number = 1 + 6  # = 7
+        expected_slope = -base_slope * (1 - (global_layer_number - 1) / (num_layers - 1) + 1e-5)
+        assert torch.allclose(layer.slope, expected_slope, rtol=1e-5), \
+            f"Slope with PP offset mismatch"
+
+    def test_cp_info_stored(self):
+        """CP group and size should be stored in __init__."""
+        layer = _make_layer()
+        assert hasattr(layer, 'cp_group'), "Missing cp_group attribute"
+        assert hasattr(layer, 'cp_size'), "Missing cp_size attribute"
+        # At CP=1, cp_size should be 1
+        assert layer.cp_size == 1

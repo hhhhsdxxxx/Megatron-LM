@@ -20,7 +20,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.group_rms_norm import GroupRMSNorm
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
-from megatron.core.utils import get_pg_rank
+from megatron.core.utils import get_pg_rank, get_pg_size, divide
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 
 # Import GLA operators
@@ -31,6 +31,14 @@ except ImportError:
     chunk_simple_gla = None
     fused_recurrent_simple_gla = None
     HAVE_GLA = False
+
+# Import CP-aware GLA operator
+try:
+    from fla.ops.lightning_attn import chunk_lightning_attn_cp
+    HAVE_CP_GLA = True
+except ImportError:
+    chunk_lightning_attn_cp = None
+    HAVE_CP_GLA = False
 
 
 class LinearAttention(Attention):
@@ -91,18 +99,25 @@ class LinearAttention(Attention):
             'fused_recurrent': fused_recurrent_simple_gla,
         }
 
+        # Store CP info for context-parallel support
+        self.cp_group = self.pg_collection.cp
+        self.cp_size = get_pg_size(self.pg_collection.cp)
+
         # Build layer-dependent slope tensor
         # The slope varies by layer to provide different decay patterns
-        # Reference formula uses 0-indexed layer_idx:
-        #   slope = -base_slope * (1 - (layer_idx - 1) / (num_layers - 1) + 1e-5)
-        # Megatron's layer_number is 1-indexed, so we convert: layer_idx_0based = layer_number - 1
-        # Substituting: (layer_idx_0based - 1) = (layer_number - 1 - 1) = (layer_number - 2)
+        # Reference formula uses 1-indexed global_layer_number:
+        #   slope = -base_slope * (1 - (global_layer_number - 1) / (num_layers - 1) + 1e-5)
+        # global_layer_number accounts for PP offset so first layer globally = 1
         base_slope = self._build_slope_tensor(config.num_attention_heads)
         num_layers = config.num_layers
-        slope = -base_slope * (1 - (layer_number - 2) / max(num_layers - 1, 1) + 1e-5)
+        global_layer_number = self.layer_number + (self._pp_layer_offset or 0)
+        slope = -base_slope * (1 - (global_layer_number - 1) / max(num_layers - 1, 1) + 1e-5)
 
-        # Register slope as buffer (non-persistent, will be recomputed)
-        self.register_buffer('slope', slope, persistent=False)
+        # Register only the TP-local slope slice (like reference)
+        num_heads_per_partition = self.num_attention_heads_per_partition
+        tp_rank = get_pg_rank(self.pg_collection.tp)
+        tp_slope = slope[tp_rank * num_heads_per_partition : (tp_rank + 1) * num_heads_per_partition]
+        self.register_buffer('slope', tp_slope, persistent=False)
 
         # MEG-2: Initialize GroupRMSNorm with TP-local size
         # g_proj uses gather_output=False, so its output and attn_output are TP-local.
@@ -127,16 +142,20 @@ class LinearAttention(Attention):
             skip_bias_add=False,
         )
 
+        # Override KV projection sizing with linear_attn_num_query_groups and kv_expand
+        linear_attn_num_query_groups = (
+            config.linear_attn_num_query_groups
+            if config.linear_attn_num_query_groups > 0
+            else config.num_query_groups
+        )
+        world_size = get_pg_size(self.pg_collection.tp)
+        self.num_query_groups_per_partition = divide(linear_attn_num_query_groups, world_size)
+
         # Initialize QKV projection (required by get_query_key_value_tensors)
         # P1 Fix: Use global head counts because ColumnParallelLinear automatically shards output_size
         # Using per-partition counts would cause double-partitioning in TP environments
-        #
-        # Reference alignment: LinearAttention always uses MHA (num_kv_heads == num_q_heads),
-        # regardless of the global num_query_groups config (which may differ for MLA layers).
-        # Override kv_projection_size and num_query_groups_per_partition accordingly.
         self.query_projection_size = config.kv_channels * config.num_attention_heads
-        self.kv_projection_size = config.kv_channels * config.num_attention_heads
-        self.num_query_groups_per_partition = self.num_attention_heads_per_partition
+        self.kv_projection_size = config.kv_channels * config.kv_expand * linear_attn_num_query_groups
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
         self.linear_qkv = submodules.linear_qkv(
             config.hidden_size,
@@ -275,25 +294,27 @@ class LinearAttention(Attention):
             If split_qkv=True: (q, k, v)
             If split_qkv=False: (qkv, split_indices)
         """
+        # Project to QKV (shared by both split and non-split paths)
+        qkv, _ = self.linear_qkv(hidden_states)
+
+        # Apply SiLU activation to QKV projections if configured
+        if self.config.use_linear_silu:
+            qkv = torch.nn.functional.silu(qkv)
+
         if not split_qkv:
             # Return packed QKV with split indices
-            qkv, _ = self.linear_qkv(hidden_states)
-            # Split indices for [q_heads, kv_heads, kv_heads] using TP-local counts
             split_indices = [
                 self.num_attention_heads_per_partition * self.config.kv_channels,
-                self.num_query_groups_per_partition * self.config.kv_channels,
-                self.num_query_groups_per_partition * self.config.kv_channels,
+                self.num_query_groups_per_partition * self.config.kv_channels * self.config.kv_expand,
+                self.num_query_groups_per_partition * self.config.kv_channels * self.config.kv_expand,
             ]
             return qkv, split_indices
-
-        # Project to QKV
-        qkv, _ = self.linear_qkv(hidden_states)
 
         # Split into Q, K, V using TP-local head counts
         # Shape: [sq, b, (num_heads_per_partition + 2*num_kv_heads_per_partition) * head_dim]
         # Use TP-local head counts since QKV projection is tensor-parallel (gather_output=False)
         q_size = self.num_attention_heads_per_partition * self.config.kv_channels
-        kv_size = self.num_query_groups_per_partition * self.config.kv_channels
+        kv_size = self.num_query_groups_per_partition * self.config.kv_channels * self.config.kv_expand
 
         q = qkv[:, :, :q_size]
         k = qkv[:, :, q_size:q_size + kv_size]
@@ -360,12 +381,12 @@ class LinearAttention(Attention):
                 f"got {attention_mask.dim()}D mask with shape {attention_mask.shape}."
             )
 
-        # MEG-5: Reject packed sequences - not implemented for LinearAttention
+        # Handle packed sequence params for THD format
         if packed_seq_params is not None:
-            raise NotImplementedError(
-                "LinearAttention does not support packed sequences (THD format). "
-                "Please use unpacked sequences."
-            )
+            cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded if packed_seq_params.cu_seqlens_q_padded is not None else packed_seq_params.cu_seqlens_q
+            cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded if packed_seq_params.cu_seqlens_kv_padded is not None else packed_seq_params.cu_seqlens_kv
+        else:
+            cu_seqlens_q = cu_seqlens_kv = None
 
         # Get sequence length for mode selection
         sq = hidden_states.size(0)
@@ -388,8 +409,9 @@ class LinearAttention(Attention):
         # P1 Fix: Reshape Q/K before applying QK layernorm
         # q and k are currently [sq, b, num_heads * head_dim]
         # Reshape to [sq, b, num_heads, head_dim] before normalization
+        kv_head_dim = self.hidden_size_per_attention_head * self.config.kv_expand
         q = q.view(sq, b, self.num_attention_heads_per_partition, self.hidden_size_per_attention_head)
-        k = k.view(sq, b, self.num_query_groups_per_partition, self.hidden_size_per_attention_head)
+        k = k.view(sq, b, self.num_query_groups_per_partition, kv_head_dim)
 
         # Apply QK normalization if enabled (now with correct shape)
         if self.q_layernorm is not None:
@@ -476,13 +498,14 @@ class LinearAttention(Attention):
         num_heads = self.num_attention_heads_per_partition
         num_kv_heads = self.num_query_groups_per_partition
         head_dim = self.hidden_size_per_attention_head
+        kv_head_dim = head_dim * self.config.kv_expand
 
         # Reshape Q: [sq, b, num_heads_local * head_dim] -> [b, sq, num_heads_local, head_dim]
         q = q.view(sq, b, num_heads, head_dim).transpose(0, 1).contiguous()
 
-        # Reshape K, V: [sq, b, num_kv_heads_local * head_dim] -> [b, sq, num_kv_heads_local, head_dim]
-        k = k.view(sq, b, num_kv_heads, head_dim).transpose(0, 1).contiguous()
-        v = v.view(sq, b, num_kv_heads, head_dim).transpose(0, 1).contiguous()
+        # Reshape K, V: [sq, b, num_kv_heads_local * kv_head_dim] -> [b, sq, num_kv_heads_local, kv_head_dim]
+        k = k.view(sq, b, num_kv_heads, kv_head_dim).transpose(0, 1).contiguous()
+        v = v.view(sq, b, num_kv_heads, kv_head_dim).transpose(0, 1).contiguous()
 
         # Handle GQA (grouped query attention) - expand K, V if needed
         if num_kv_heads < num_heads:
@@ -536,24 +559,37 @@ class LinearAttention(Attention):
         # Apply GLA kernel
         gla_fn = self.gla_ops[mode]
 
-        # MEG-2: Slice slope to TP-local partition
-        # self.slope has shape [global_num_heads], slice to local heads for this TP rank
-        # Use get_pg_rank with pg_collection.tp for safe fallback (returns 0 when
-        # distributed is not initialized or group is None).
-        tp_rank = get_pg_rank(self.pg_collection.tp)
-        local_slope = self.slope[tp_rank * num_heads : (tp_rank + 1) * num_heads]
+        # self.slope is already TP-local (sliced in __init__)
+        local_slope = self.slope
         slope_expanded = local_slope[None, None, :].expand(b, sq, num_heads)
 
-        # Call GLA kernel
-        # Returns: (output, recurrent_state)
-        attn_output, recurrent_state = gla_fn(
-            q=q,
-            k=k,
-            v=v,
-            g=slope_expanded,
-            initial_state=recurrent_state,
-            output_final_state=output_final_state,
-        )
+        # Call GLA kernel with CP branching
+        cp_size = get_pg_size(self.pg_collection.cp)
+        if cp_size <= 1:
+            attn_output, recurrent_state = gla_fn(
+                q=q,
+                k=k,
+                v=v,
+                g=slope_expanded,
+                initial_state=recurrent_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens_q,
+            )
+        else:
+            if not HAVE_CP_GLA:
+                raise ImportError(
+                    "CP-aware GLA operator not found. Please install fla with "
+                    "chunk_lightning_attn_cp support."
+                )
+            attn_output, recurrent_state = chunk_lightning_attn_cp(
+                q=q,
+                k=k,
+                v=v,
+                g_gamma=local_slope,
+                initial_state=recurrent_state,
+                output_final_state=output_final_state,
+                cp_group=self.cp_group,
+            )
 
         # Store recurrent state back to inference context if needed
         if output_final_state and inference_context is not None:
@@ -578,12 +614,8 @@ class LinearAttention(Attention):
         # Project hidden_states to get gate values
         gate, _ = self.g_proj(hidden_states)
 
-        # Apply gating activation (in-place for efficiency)
-        # Reference uses sigmoid; config.linear_attn_silu controls SiLU vs sigmoid
-        if self.config.linear_attn_silu:
-            attn_output = attn_output * torch.nn.functional.silu(gate)
-        else:
-            attn_output = attn_output * torch.sigmoid_(gate)
+        # Apply gating activation — always sigmoid (reference alignment)
+        attn_output = attn_output * torch.sigmoid(gate)
 
         # Apply output projection
         output, output_bias = self.linear_proj(attn_output)

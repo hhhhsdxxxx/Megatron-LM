@@ -246,6 +246,15 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use SiLU activation in linear attention gating.
     When enabled (--linear-attn-silu), SiLU is used instead of the default sigmoid."""
 
+    use_linear_silu: bool = False
+    """Apply SiLU activation to QKV projections in linear attention (before Q/K/V split)."""
+
+    kv_expand: int = 1
+    """Expansion factor for KV projection size in linear attention."""
+
+    linear_attn_num_query_groups: int = 0
+    """Number of KV head groups for linear attention. 0 = fallback to num_query_groups."""
+
     normalization: Literal['LayerNorm', 'RMSNorm'] = "LayerNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 
