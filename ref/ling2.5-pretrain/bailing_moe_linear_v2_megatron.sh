@@ -179,7 +179,6 @@ MOE_ARGS=(
 
     # Router precision and initialization (matching reference)
     --moe-router-dtype fp32
-    --moe-router-kaiming-init
 
     # Expert configuration
     --moe-ffn-hidden-size 512
