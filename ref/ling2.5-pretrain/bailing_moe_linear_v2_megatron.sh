@@ -177,6 +177,10 @@ MOE_ARGS=(
     --moe-router-enable-expert-bias
     --moe-router-topk-scaling-factor 2.5
 
+    # Router precision and initialization (matching reference)
+    --moe-router-dtype fp32
+    --moe-router-kaiming-init
+
     # Expert configuration
     --moe-ffn-hidden-size 512
     --moe-shared-expert-intermediate-size 2048

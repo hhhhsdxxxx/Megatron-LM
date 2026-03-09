@@ -72,7 +72,12 @@ class Router(ABC, MegatronModule):
     def reset_parameters(self):
         """Reset the router parameters."""
         if self.config.perform_initialization:
-            self.config.init_method(self.weight)
+            if self.config.moe_router_kaiming_init:
+                import math
+
+                torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+            else:
+                self.config.init_method(self.weight)
             if self.bias is not None:
                 self.config.init_method(self.bias)
         self.weight.data = self.weight.data.to(dtype=self.config.params_dtype)

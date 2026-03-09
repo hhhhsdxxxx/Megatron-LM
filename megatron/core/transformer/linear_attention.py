@@ -21,6 +21,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.group_rms_norm import GroupRMSNorm
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.utils import get_pg_rank
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 
 # Import GLA operators
 try:
@@ -168,6 +169,26 @@ class LinearAttention(Attention):
             )
         else:
             self.k_layernorm = None
+
+        # Internal RotaryEmbedding for LinearAttention
+        # In hybrid MLA mode, gpt_model.py skips creating the external RoPE when
+        # config.multi_latent_attention is True (MLA creates its own internal RoPE).
+        # LinearAttention needs its own internal RoPE to ensure position embeddings
+        # are applied regardless of MLA configuration.
+        # Reference: LinearAttention always uses non-interleaved RoPE (rotate_half),
+        # so we hardcode rotary_interleaved=False.
+        self.rotary_interleaved = False
+        if config.position_embedding_type == 'rope':
+            self.rotary_pos_emb = RotaryEmbedding(
+                kv_channels=config.kv_channels,
+                rotary_percent=config.rotary_percent,
+                rotary_interleaved=False,
+                rotary_base=config.rotary_base,
+                use_cpu_initialization=config.use_cpu_initialization,
+                cp_group=self.pg_collection.cp,
+            )
+        else:
+            self.rotary_pos_emb = None
 
     def backward_dw(self) -> None:
         """Execute weight update operations for all projections.
@@ -379,6 +400,10 @@ class LinearAttention(Attention):
         # P1 Fix: Apply RoPE on per-head Q/K tensors
         # Keep q and k in [sq, b, num_heads, head_dim] shape for RoPE
         # Megatron's RoPE helpers expect per-head layout where last dim is head_dim
+        #
+        # LinearAttention always uses non-interleaved RoPE (rotate_half, Llama-style),
+        # matching the reference apply_rotary_pos_emb() which uses rotate_half internally.
+        # When no external RoPE is provided (hybrid MLA mode), compute internally.
         if rotary_pos_cos is not None and rotary_pos_sin is not None:
             # Use cos/sin directly
             from megatron.core.models.common.embeddings.rope_utils import (
@@ -386,14 +411,17 @@ class LinearAttention(Attention):
             )
 
             q = apply_rotary_pos_emb_with_cos_sin(
-                q, rotary_pos_cos, rotary_pos_sin, rotary_interleaved=self.config.rotary_interleaved
+                q, rotary_pos_cos, rotary_pos_sin, rotary_interleaved=self.rotary_interleaved
             )
             k = apply_rotary_pos_emb_with_cos_sin(
-                k, rotary_pos_cos, rotary_pos_sin, rotary_interleaved=self.config.rotary_interleaved
+                k, rotary_pos_cos, rotary_pos_sin, rotary_interleaved=self.rotary_interleaved
             )
         elif rotary_pos_emb is not None:
             # Use rotary_pos_emb (freqs)
-            from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
+            # Use lower-level _apply_rotary_pos_emb_bshd to override rotary_interleaved
+            from megatron.core.models.common.embeddings.rope_utils import (
+                _apply_rotary_pos_emb_bshd,
+            )
 
             # Handle tuple format (q_pos_emb, k_pos_emb)
             if isinstance(rotary_pos_emb, tuple):
@@ -402,21 +430,38 @@ class LinearAttention(Attention):
                 q_pos_emb = k_pos_emb = rotary_pos_emb
 
             if q_pos_emb is not None:
-                q = apply_rotary_pos_emb(
+                q = _apply_rotary_pos_emb_bshd(
                     q,
                     q_pos_emb,
-                    config=self.config,
-                    cu_seqlens=None,  # Not using packed sequences
-                    mscale=1.0,
+                    rotary_interleaved=self.rotary_interleaved,
                 )
             if k_pos_emb is not None:
-                k = apply_rotary_pos_emb(
+                k = _apply_rotary_pos_emb_bshd(
                     k,
                     k_pos_emb,
-                    config=self.config,
-                    cu_seqlens=None,
-                    mscale=1.0,
+                    rotary_interleaved=self.rotary_interleaved,
                 )
+        elif self.rotary_pos_emb is not None:
+            # No external RoPE provided (hybrid MLA mode) — compute internally
+            # Use forward() which handles CP-aware position remapping
+            from megatron.core.models.common.embeddings.rope_utils import (
+                _apply_rotary_pos_emb_bshd,
+            )
+
+            rotary_seq_len = sq
+            if inference_context is not None:
+                if hasattr(inference_context, 'sequence_len_offset'):
+                    rotary_seq_len += inference_context.sequence_len_offset
+                elif sequence_len_offset is not None:
+                    rotary_seq_len += sequence_len_offset
+            # forward() returns CP-aware freqs of shape [seq, 1, 1, dim]
+            freqs = self.rotary_pos_emb(rotary_seq_len)
+            q = _apply_rotary_pos_emb_bshd(
+                q, freqs, rotary_interleaved=self.rotary_interleaved,
+            )
+            k = _apply_rotary_pos_emb_bshd(
+                k, freqs, rotary_interleaved=self.rotary_interleaved,
+            )
 
         # Flatten q and k back to [sq, b, num_heads * head_dim] after RoPE
         q = q.view(sq, b, -1)

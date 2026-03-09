@@ -760,8 +760,13 @@ class TransformerConfig(ModelParallelConfig):
     and decreased for the experts with more assigned tokens.
     The default value 1e-3 is same as that used in DeepSeekV3."""
 
+    moe_router_kaiming_init: bool = False
+    """Use kaiming_uniform_ initialization for the MoE router weight instead of the default
+    init_method (which is typically normal_). This matches the reference BailingMoE v2.5
+    router initialization: kaiming_uniform_(weight, a=sqrt(5))."""
+
     moe_router_force_load_balancing: bool = False
-    """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
+    """[Experimental] Force load balancing with random logits for MoE router, supports naive topk
     and group-limited topk. This is an experimental feature and only for benchmark."""
 
     moe_grouped_gemm: bool = False
