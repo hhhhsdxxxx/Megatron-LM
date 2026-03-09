@@ -578,9 +578,12 @@ class LinearAttention(Attention):
         # Project hidden_states to get gate values
         gate, _ = self.g_proj(hidden_states)
 
-        # Apply gating with sigmoid activation (in-place for efficiency)
-        # output = normalized_attn_output * sigmoid(gate)
-        attn_output = attn_output * torch.sigmoid_(gate)
+        # Apply gating activation (in-place for efficiency)
+        # Reference uses sigmoid; config.linear_attn_silu controls SiLU vs sigmoid
+        if self.config.linear_attn_silu:
+            attn_output = attn_output * torch.nn.functional.silu(gate)
+        else:
+            attn_output = attn_output * torch.sigmoid_(gate)
 
         # Apply output projection
         output, output_bias = self.linear_proj(attn_output)

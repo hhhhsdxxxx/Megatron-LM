@@ -166,7 +166,7 @@ GPT_MODEL_ARGS=(
     --untie-embeddings-and-output-weights
 
     # MLA dimension args (for hybrid Linear Attention + MLA layers)
-    --q-lora-rank 1536
+    --q-lora-rank 256
     --kv-lora-rank 512
     --qk-head-dim 128
     --qk-pos-emb-head-dim 64
@@ -188,6 +188,7 @@ GPT_MODEL_ARGS=(
 LINEAR_ATTN_ARGS=(
     --linear-attention-freq "([1]*4+[0]*1)*4"
     --linear-attn-norm-group-size 4
+    --linear-attn-norm-group-type group_diff
 )
 
 # ============================================================================
@@ -205,14 +206,15 @@ MOE_ARGS=(
     --moe-router-topk-scaling-factor 2.5
     --moe-router-score-function sigmoid
     --moe-router-enable-expert-bias
+    --moe-router-bias-update-rate 1e-3
+    --moe-router-bias-zero-mean-update
 
     # Token dispatcher
     --moe-token-dispatcher-type flex
     --moe-grouped-gemm
 
-    # Router load balancing
-    --moe-router-load-balancing-type aux_loss
-    --moe-aux-loss-coeff 0.0000035
+    # Router z-loss (matching reference moe-z-loss-coeff)
+    --moe-z-loss-coeff 0.0000035
 
     # Expert configuration
     --moe-ffn-hidden-size 512

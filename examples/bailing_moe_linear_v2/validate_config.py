@@ -38,7 +38,7 @@ REFERENCE_PARAMS = {
     "shared_expert_intermediate_size": 2048,
     "routed_scaling_factor": 2.5,
     "first_k_dense_replace": 1,
-    "moe_aux_loss_coeff": 0.0000035,
+    "moe_z_loss_coeff": 0.0000035,
     "score_function": "sigmoid",
     "enable_expert_bias": True,
 
@@ -60,7 +60,7 @@ REFERENCE_PARAMS = {
     "vocab_size": 157184,
 
     # MLA Dimension Configuration
-    "q_lora_rank": 1536,
+    "q_lora_rank": 256,
     "kv_lora_rank": 512,
     "qk_head_dim": 128,
     "qk_pos_emb_head_dim": 64,
@@ -126,7 +126,7 @@ def extract_script_params(script_path: Path) -> Dict[str, Any]:
         "moe_router_score_function": r"--moe-router-score-function\s+(\w+)",
         "moe_ffn_hidden_size": r"--moe-ffn-hidden-size\s+(\d+)",
         "moe_shared_expert_intermediate_size": r"--moe-shared-expert-intermediate-size\s+(\d+)",
-        "moe_aux_loss_coeff": r"--moe-aux-loss-coeff\s+([\d.eE+-]+)",
+        "moe_z_loss_coeff": r"--moe-z-loss-coeff\s+([\d.eE+-]+)",
         "moe_layer_freq": r'--moe-layer-freq\s+"([^"]+)"',
 
         # Linear Attention
@@ -223,7 +223,7 @@ def validate_parameters(script_params: Dict[str, Any]) -> Tuple[bool, List[str]]
         "moe_router_score_function": "score_function",
         "moe_ffn_hidden_size": "moe_intermediate_size",
         "moe_shared_expert_intermediate_size": "shared_expert_intermediate_size",
-        "moe_aux_loss_coeff": "moe_aux_loss_coeff",
+        "moe_z_loss_coeff": "moe_z_loss_coeff",
         "moe_router_enable_expert_bias": "enable_expert_bias",
 
         # Linear Attention

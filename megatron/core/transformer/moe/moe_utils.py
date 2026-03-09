@@ -1122,14 +1122,18 @@ def track_moe_metrics(
 
 
 def get_updated_expert_bias(
-    tokens_per_expert: torch.Tensor, expert_bias: torch.Tensor, expert_bias_update_rate: float
+    tokens_per_expert: torch.Tensor,
+    expert_bias: torch.Tensor,
+    expert_bias_update_rate: float,
+    zero_mean_update: bool = False,
 ) -> torch.Tensor:
     """Update expert bias for biased expert routing. See https://arxiv.org/abs/2408.15664v1#
 
     Args:
         tokens_per_expert (torch.Tensor): The number of tokens assigned to each expert.
         expert_bias (torch.Tensor): The bias for each expert.
-        expert_bias_udpate_rate (float): The update rate for the expert bias.
+        expert_bias_update_rate (float): The update rate for the expert bias.
+        zero_mean_update (bool): If True, normalize the updated bias to have zero mean.
 
     Returns:
         torch.Tensor: The updated expert bias.
@@ -1144,6 +1148,10 @@ def get_updated_expert_bias(
         average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
         offset = average_tokens - tokens_per_expert
         updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate
+        if zero_mean_update:
+            updated_expert_bias = updated_expert_bias - updated_expert_bias.mean(
+                dim=-1, keepdim=True
+            )
         return updated_expert_bias
 
 

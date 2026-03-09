@@ -141,6 +141,7 @@ GPT_MODEL_ARGS=(
 LINEAR_ATTN_ARGS=(
     --linear-attention-freq "([1]*4+[0]*1)*4"
     --linear-attn-norm-group-size 4
+    --linear-attn-norm-group-type group_diff
 )
 
 # ============================================================================
@@ -149,7 +150,7 @@ LINEAR_ATTN_ARGS=(
 # Standard attention layers (every 5th layer) use MLA instead of vanilla MHA
 MLA_ARGS=(
     --multi-latent-attention
-    --q-lora-rank 1536
+    --q-lora-rank 256
     --kv-lora-rank 512
     --qk-head-dim 128
     --qk-pos-emb-head-dim 64
@@ -168,13 +169,14 @@ MOE_ARGS=(
     --moe-token-dispatcher-type flex
     --moe-grouped-gemm
 
-    # Router configuration (group-limited TopK, matching reference BailingMoeV2_5Gate)
-    --moe-router-load-balancing-type aux_loss
-    --moe-aux-loss-coeff 0.0000035
+    # Router z-loss (matching reference moe-z-loss-coeff)
+    --moe-z-loss-coeff 0.0000035
     --moe-router-score-function sigmoid
     --moe-router-num-groups 8
     --moe-router-group-topk 4
     --moe-router-enable-expert-bias
+    --moe-router-bias-update-rate 1e-3
+    --moe-router-bias-zero-mean-update
     --moe-router-topk-scaling-factor 2.5
 
     # Router precision and initialization (matching reference)

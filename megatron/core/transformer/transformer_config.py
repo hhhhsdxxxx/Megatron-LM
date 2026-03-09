@@ -242,6 +242,10 @@ class TransformerConfig(ModelParallelConfig):
     """Type of group normalization to use in linear attention.
     Options include 'group_diff' for group-based differential normalization."""
 
+    linear_attn_silu: bool = False
+    """Whether to use SiLU activation in linear attention gating.
+    When enabled (--linear-attn-silu), SiLU is used instead of the default sigmoid."""
+
     normalization: Literal['LayerNorm', 'RMSNorm'] = "LayerNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 
@@ -759,6 +763,11 @@ class TransformerConfig(ModelParallelConfig):
     in a global batch, where the bias is increased for the experts with less assigned tokens
     and decreased for the experts with more assigned tokens.
     The default value 1e-3 is same as that used in DeepSeekV3."""
+
+    moe_router_bias_zero_mean_update: bool = False
+    """When enabled, the updated expert bias is zero-mean normalized after each update step,
+    i.e. updated_bias = updated_bias - mean(updated_bias). This eliminates drift in the
+    overall bias magnitude and preserves only relative differences between experts."""
 
     moe_router_kaiming_init: bool = False
     """Use kaiming_uniform_ initialization for the MoE router weight instead of the default
