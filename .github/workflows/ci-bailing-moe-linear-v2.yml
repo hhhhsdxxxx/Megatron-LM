@@ -17,8 +17,6 @@ jobs:
     name: BailingMoE Linear V2 - 10 Step Smoke Test
     runs-on: [self-hosted, 8xH200]
     timeout-minutes: 60
-    env:
-      JOB_DIR: ${{ runner.temp }}/bailing-moe-linear-v2-ci
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -27,4 +25,6 @@ jobs:
         run: pip install flash-linear-attention
 
       - name: Run BailingMoE Linear V2 pretraining (10 steps)
+        env:
+          JOB_DIR: ${{ runner.temp }}/bailing-moe-linear-v2-ci
         run: bash ci_bailing_moe_linear_v2.sh
