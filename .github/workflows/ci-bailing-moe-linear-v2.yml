@@ -1,0 +1,30 @@
+name: CI - BailingMoE Linear V2 Pretrain
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  DATA_PATH: ${{ vars.BAILING_DATA_PATH }}
+  TOKENIZER_MODEL: ${{ vars.BAILING_TOKENIZER_MODEL }}
+  FLASH_LINEAR_PATH: ${{ vars.BAILING_FLASH_LINEAR_PATH }}
+
+jobs:
+  pretrain-smoke-test:
+    name: BailingMoE Linear V2 - 10 Step Smoke Test
+    runs-on: [self-hosted, 8xH200]
+    timeout-minutes: 60
+    env:
+      JOB_DIR: ${{ runner.temp }}/bailing-moe-linear-v2-ci
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install flash-linear-attention
+        run: pip install flash-linear-attention
+
+      - name: Run BailingMoE Linear V2 pretraining (10 steps)
+        run: bash ci_bailing_moe_linear_v2.sh
