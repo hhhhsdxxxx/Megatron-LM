@@ -1932,6 +1932,8 @@ def _add_network_size_args(parser):
         "persist_layer_norm",
         "bias_dropout_fusion",
         "apply_rope_fusion",
+        # registered by _add_mixed_precision_args
+        "skip_casting_dtype_for_param_pattern",
         # registered by _add_mla_args
         "q_lora_rank",
         "kv_lora_rank",
@@ -2518,6 +2520,11 @@ def _add_mixed_precision_args(parser):
                        'for lm head to fp16.')
     group.add_argument('--reuse-grad-buf-for-mxfp8-param-ag', action='store_true',
                        help='If True, reuse the grad buffer for MXFP8 parameter all-gather.')
+    group.add_argument('--skip-casting-dtype-for-param-pattern', type=str, nargs='+',
+                       default=None,
+                       help='Skip casting dtype for parameters or buffers matching '
+                       'this regex pattern(s) when training with fp16 or bf16. '
+                       'E.g. "^expert_bias$|.+\\.expert_bias$"')
 
     return parser
 

@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron Module."""
+import re
 from functools import partial
 from typing import Optional, Tuple
 
@@ -448,6 +449,19 @@ class Float16Module(MegatronModule):
 
         else:
             raise Exception('Either config.fp16 or config.bf16 should be True.')
+
+        # Restore float32 for parameters/buffers matching skip patterns.
+        skip_patterns = config.skip_casting_dtype_for_param_pattern
+        if skip_patterns is not None:
+            if isinstance(skip_patterns, str):
+                skip_patterns = [skip_patterns]
+            compiled = [re.compile(p) for p in skip_patterns]
+            for name, param in self.module.named_parameters():
+                if param.is_floating_point() and any(p.search(name) for p in compiled):
+                    param.data = param.data.to(torch.float32)
+            for name, buf in self.module.named_buffers():
+                if buf.is_floating_point() and any(p.search(name) for p in compiled):
+                    buf.data = buf.data.to(torch.float32)
 
         self.float16_convertor = float16_convertor
 

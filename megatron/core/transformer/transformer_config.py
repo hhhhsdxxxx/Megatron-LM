@@ -475,6 +475,11 @@ class TransformerConfig(ModelParallelConfig):
     """If True, run attention masking and softmax in fp32. This should be True if
     apply_query_key_layer_scaling is True."""
 
+    skip_casting_dtype_for_param_pattern: Union[str, List[str]] = None
+    r"""Skip casting dtype for parameters or buffers matching this pattern(s) when training with
+    fp16 or bf16. Note: this pattern(s) must be regular expression,
+    e.g. ["^expert_bias$|.+\.expert_bias$"]"""
+
     disable_bf16_reduced_precision_matmul: bool = False
     """If True, sets torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False to
     prevent matmul from using reduced precision accumulation when using BF16."""
