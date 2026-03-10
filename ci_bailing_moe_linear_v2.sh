@@ -144,7 +144,7 @@ GPT_MODEL_ARGS=(
     --num-layers 20
     --hidden-size 2048
     --num-attention-heads 16
-    --num-query-groups 4
+    --num-query-groups 16
     --ffn-hidden-size 5120
 
     # Attention configuration
@@ -217,6 +217,7 @@ MOE_ARGS=(
     --moe-router-enable-expert-bias
     --moe-router-bias-update-rate 1e-3
     --moe-router-bias-zero-mean-update
+    --moe-router-dtype fp32
 
     # Token dispatcher
     --moe-token-dispatcher-type flex
@@ -287,11 +288,10 @@ MODEL_PARALLEL_ARGS=(
     --pipeline-model-parallel-size 1
     --sequence-parallel
     --use-distributed-optimizer
+    --no-gradient-accumulation-fusion
 
     # Activation recomputation
     --recompute-granularity selective
-    --recompute-method uniform
-    --recompute-num-layers 1
 
     # Communication overlap
     --overlap-param-gather
@@ -340,10 +340,28 @@ DATA_ARGS=(
 )
 
 # ============================================================================
+# Checkpoint Loading (optional)
+# ============================================================================
+# Set LOAD_PATH to load a pre-converted Megatron checkpoint for continued training.
+# Convert from HF safetensors using:
+#   python tools/checkpoint/convert_bailing_moe_linear_v2_hf.py \
+#       --input-dir /path/to/hf/safetensors --output-dir /path/to/megatron/ckpt
+LOAD_PATH="${LOAD_PATH:-/data/checkpoints/bailing-moe-linear-v2}"
+
+CHECKPOINT_LOAD_ARGS=()
+if [ -n "$LOAD_PATH" ]; then
+    CHECKPOINT_LOAD_ARGS=(
+        --load ${LOAD_PATH}
+        --ckpt-format torch
+        --no-load-rng
+        --no-load-optim
+    )
+fi
+
+# ============================================================================
 # Checkpointing and Logging (CI: no checkpoint saving)
 # ============================================================================
 EVAL_AND_LOGGING_ARGS=(
-    # CI: no checkpoint loading or saving (train from scratch)
 
     # Evaluation
     --eval-interval 1490
@@ -381,6 +399,7 @@ CMD="${LAUNCHER} pretrain_gpt.py \
     ${DATA_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \
     ${KERNEL_ARGS[@]} \
+    ${CHECKPOINT_LOAD_ARGS[@]} \
 "
 
 # ============================================================================

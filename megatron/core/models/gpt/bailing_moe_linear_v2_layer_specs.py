@@ -159,8 +159,9 @@ def bailing_moe_linear_v2_block_spec(
     Returns:
         TransformerBlockSubmodules with BailingMoE Linear V2 layers
     """
-    from megatron.core.models.backends import TESpecProvider, LocalSpecProvider
-    from megatron.core.transformer.custom_layers.transformer_engine import TENorm
+    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+    from megatron.core.models.backends import LocalSpecProvider
+    from megatron.core.extensions.transformer_engine import TENorm
     from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm as LNImpl
     from megatron.core.transformer.transformer_block import get_num_layers_to_build
     from megatron.core.transformer.transformer_layer import get_transformer_layer_offset

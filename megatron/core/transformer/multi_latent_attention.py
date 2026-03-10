@@ -126,20 +126,24 @@ class MultiLatentAttention(Attention):
 
         mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
         self.softmax_scale = mscale * mscale / math.sqrt(self.q_head_dim)
-        self.cache_mla_latents = self.config.cache_mla_latents
+        self.cache_mla_latents = getattr(self.config, 'cache_mla_latents', False)
 
-        if self.config.rope_type == "rope":
+        self.rope_type = getattr(self.config, 'rope_type', 'rope')
+        rotary_percent = getattr(self.config, 'rotary_percent', 1.0)
+        rotary_base = getattr(self.config, 'rotary_base', 10000)
+
+        if self.rope_type == "rope":
             self.rotary_pos_emb = RotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
-                rotary_percent=self.config.rotary_percent,
-                rotary_base=self.config.rotary_base,
+                rotary_percent=rotary_percent,
+                rotary_base=rotary_base,
                 cp_group=self.pg_collection.cp,
             )
-        elif self.config.rope_type == "yarn":
+        elif self.rope_type == "yarn":
 
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
-                rotary_base=self.config.rotary_base,
+                rotary_base=rotary_base,
                 scaling_factor=self.config.rotary_scaling_factor,
                 original_max_position_embeddings=self.config.original_max_position_embeddings,
                 beta_fast=self.config.beta_fast,
@@ -150,13 +154,20 @@ class MultiLatentAttention(Attention):
             )
         else:
             raise ValueError(
-                f"Unsupported RoPE type: {self.config.rope_type}, supported types are "
+                f"Unsupported RoPE type: {self.rope_type}, supported types are "
                 "'rope' and 'yarn'"
             )
 
+        # MLA does not use GQA — kv_up_proj expands latents to all heads.
+        # Override num_query_groups so the core attention sees full head count.
+        import copy
+
+        core_attn_config = copy.copy(self.config)
+        core_attn_config.num_query_groups = self.config.num_attention_heads
+
         self.core_attention = build_module(
             submodules.core_attention,
-            config=self.config,
+            config=core_attn_config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
@@ -218,7 +229,10 @@ class MultiLatentAttention(Attention):
         inference_params=None,
     ):
         """Forward pass for multi-latent attention"""
-        assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into MLA."
+        # In hybrid architectures (e.g., BailingMoE Linear V2), TransformerBlock may pass
+        # rotary_pos_emb computed for Linear Attention layers. MLA has its own internal RoPE,
+        # so we simply ignore any externally-provided rotary_pos_emb.
+        rotary_pos_emb = None
         assert attention_bias is None, "Attention bias should not be passed into MLA."
         assert (
             rotary_pos_cos is None and rotary_pos_sin is None
@@ -233,10 +247,10 @@ class MultiLatentAttention(Attention):
         inference_context = deprecate_inference_params(inference_context, inference_params)
         if inference_context and not inference_context.is_static_batching():
             assert (
-                self.config.cache_mla_latents
+                self.cache_mla_latents
             ), "currently to use dynamic backend for MLA cache mla latents must be true"
 
-        if self.config.cache_mla_latents:
+        if self.cache_mla_latents:
             self.prepare_for_absorption()
 
         # =====================
@@ -547,7 +561,7 @@ class MLASelfAttention(MultiLatentAttention):
         rotary_pos_cos = None
         rotary_pos_sin = None
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if self.config.rope_type == "rope":
+        if self.rope_type == "rope":
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
         else:
             if self.config.apply_rope_fusion:
@@ -690,7 +704,7 @@ class MLASelfAttention(MultiLatentAttention):
             # Flag for whether to use absorption. We only use absorption
             # when caching the latents and in decode-only mode
             use_absorption = (
-                self.config.cache_mla_latents
+                self.cache_mla_latents
                 and inference_context
                 and inference_context.is_decode_only()
             )
@@ -744,7 +758,7 @@ class MLASelfAttention(MultiLatentAttention):
             k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
             # todo add assert about fusions and caching
-            if self.config.apply_rope_fusion:
+            if self.config.apply_rope_fusion and rotary_pos_cos is not None:
                 cp_rank = self.pg_collection.cp.rank()
                 cp_size = self.pg_collection.cp.size()
                 query = fused_apply_mla_rope_for_q(

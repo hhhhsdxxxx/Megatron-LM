@@ -21,8 +21,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install flash-linear-attention
-        run: pip install --break-system-packages flash-linear-attention
+      - name: Install dependencies
+        run: |
+          pip install --break-system-packages flash-linear-attention
+          pip install --break-system-packages --no-build-isolation git+https://github.com/deepseek-ai/DeepEP.git
 
       - name: Run BailingMoE Linear V2 pretraining (10 steps)
         env:

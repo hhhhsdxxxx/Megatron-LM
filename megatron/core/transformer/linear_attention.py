@@ -197,12 +197,12 @@ class LinearAttention(Attention):
         # Reference: LinearAttention always uses non-interleaved RoPE (rotate_half),
         # so we hardcode rotary_interleaved=False.
         self.rotary_interleaved = False
-        if config.position_embedding_type == 'rope':
+        if getattr(config, 'position_embedding_type', 'rope') == 'rope':
             self.rotary_pos_emb = RotaryEmbedding(
                 kv_channels=config.kv_channels,
-                rotary_percent=config.rotary_percent,
+                rotary_percent=getattr(config, 'rotary_percent', 1.0),
                 rotary_interleaved=False,
-                rotary_base=config.rotary_base,
+                rotary_base=getattr(config, 'rotary_base', 10000),
                 use_cpu_initialization=config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
