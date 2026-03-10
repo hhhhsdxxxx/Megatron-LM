@@ -220,6 +220,7 @@ class SelfAttentionSubmodules:
     linear_qkv: LinearQkvBuilder
     core_attention: CoreAttentionBuilder
     linear_proj: Union[ModuleSpec, type] = None
+    linear_g_proj: Union[type, None] = None
     q_layernorm: LayerNormBuilder | None = None
     k_layernorm: LayerNormBuilder | None = None
 

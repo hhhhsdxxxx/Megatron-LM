@@ -143,7 +143,10 @@ class LinearAttention(Attention):
 
         # Initialize gating projection
         # Projects from hidden_size to num_heads * kv_channels
-        self.g_proj = ColumnParallelLinear(
+        # Use TE linear from submodules when available (for FP8 support),
+        # fall back to ColumnParallelLinear for backward compatibility.
+        g_proj_builder = getattr(submodules, 'linear_g_proj', None) or ColumnParallelLinear
+        self.g_proj = g_proj_builder(
             config.hidden_size,
             config.num_attention_heads * config.kv_channels,
             config=config,
@@ -151,6 +154,9 @@ class LinearAttention(Attention):
             bias=False,
             gather_output=False,
             skip_bias_add=False,
+            is_expert=False,
+            tp_comm_buffer_name='g_proj',
+            tp_group=self.pg_collection.tp,
         )
 
         # Override KV projection sizing with linear_attn_num_query_groups and kv_expand

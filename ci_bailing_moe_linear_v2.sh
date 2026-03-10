@@ -144,11 +144,10 @@ GPT_MODEL_ARGS=(
     --num-layers 20
     --hidden-size 2048
     --num-attention-heads 16
-    --num-query-groups 16
+    --num-query-groups 4
     --ffn-hidden-size 5120
 
     # Attention configuration
-    --group-query-attention
     --qk-layernorm
     --use-flash-attn
     --attention-dropout 0
@@ -174,6 +173,7 @@ GPT_MODEL_ARGS=(
     --untie-embeddings-and-output-weights
 
     # MLA dimension args (for hybrid Linear Attention + MLA layers)
+    --multi-latent-attention
     --q-lora-rank 256
     --kv-lora-rank 512
     --qk-head-dim 128
@@ -240,7 +240,6 @@ MOE_ARGS=(
 MTP_ARGS=(
     --mtp-num-layers 1
     --mtp-loss-scaling-factor 0.1
-    --mtp-loss-scaling-per-layer
 )
 
 # ============================================================================
@@ -277,6 +276,9 @@ TRAINING_ARGS=(
 
     # Precision
     --bf16
+    --fp8-param-gather
+    --fp8-recipe blockwise
+    --fp8-format e4m3
 )
 
 # ============================================================================

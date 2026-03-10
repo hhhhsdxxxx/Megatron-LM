@@ -62,6 +62,7 @@ def get_bailing_moe_linear_v2_layer_spec(
                 linear_qkv=backend.column_parallel_linear(),
                 core_attention=backend.core_attention(),
                 linear_proj=backend.row_parallel_linear(),
+                linear_g_proj=backend.column_parallel_linear(),
                 q_layernorm=qk_layer_norm,
                 k_layernorm=qk_layer_norm,
             ),

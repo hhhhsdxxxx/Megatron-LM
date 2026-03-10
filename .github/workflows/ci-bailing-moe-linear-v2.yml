@@ -24,6 +24,10 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --break-system-packages flash-linear-attention
+          # Upgrade PyTorch to cu129 AFTER fla (which may pull cu128 torch) but
+          # BEFORE DeepEP (which imports torch during setup.py).
+          # FP8 blockwise recipe requires CUDA >= 12.9.
+          pip install --break-system-packages torch==2.10.0+cu129 --index-url https://download.pytorch.org/whl/cu129
           pip install --break-system-packages --no-build-isolation git+https://github.com/deepseek-ai/DeepEP.git
 
       - name: Run BailingMoE Linear V2 pretraining (10 steps)
