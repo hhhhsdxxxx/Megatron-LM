@@ -156,7 +156,10 @@ class GPTModel(LanguageModule):
                 tp_group=self.pg_collection.tp,
             )
 
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+        _has_linear_attn = self.config.linear_attention_freq is not None
+        if self.position_embedding_type == 'rope' and (
+            not self.config.multi_latent_attention or _has_linear_attn
+        ):
             self.rotary_pos_emb = RotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
@@ -335,7 +338,10 @@ class GPTModel(LanguageModule):
         # this is used to store combined cos/sin embeddings, exclusively for flash infer rope
         rotary_pos_cos_sin = None
 
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+        _has_linear_attn = self.config.linear_attention_freq is not None
+        if self.position_embedding_type == 'rope' and (
+            not self.config.multi_latent_attention or _has_linear_attn
+        ):
             use_flash_infer_fused_rope = (
                 hasattr(inference_context, 'use_flashinfer_fused_rope')
                 and inference_context.use_flashinfer_fused_rope

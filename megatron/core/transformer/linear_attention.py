@@ -22,13 +22,9 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.group_rms_norm import GroupRMSNorm
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.utils import get_pg_rank, get_pg_size, divide
-from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
-)
-from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import (
-    _yarn_get_concentration_factor_from_config,
 )
 
 # Import GLA operators
@@ -70,7 +66,6 @@ class LinearAttention(Attention):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
-        rotary_pos_emb: Optional[RotaryEmbedding] = None,
     ):
         """Initialize LinearAttention layer.
 
@@ -83,9 +78,6 @@ class LinearAttention(Attention):
             cp_comm_type: Context parallel communication type
             pg_collection: Process group collection for distributed training
             pp_layer_offset: Pipeline parallel layer offset
-            rotary_pos_emb: External RotaryEmbedding instance. If provided, used
-                directly; otherwise an internal instance is constructed as fallback
-                (for hybrid MLA mode where GPTModel skips RoPE creation).
         """
         super().__init__(
             config=config,
@@ -214,28 +206,6 @@ class LinearAttention(Attention):
             )
         else:
             self.k_layernorm = None
-
-        # RotaryEmbedding for LinearAttention
-        # Accept an externally constructed instance (with full parameters like
-        # rope_scaling, seq_len_interpolation_factor, etc.) when available.
-        # Fall back to internal construction for hybrid MLA mode where GPTModel
-        # skips creating external RoPE (multi_latent_attention=True).
-        if rotary_pos_emb is not None:
-            self.rotary_pos_emb = rotary_pos_emb
-        elif getattr(config, 'position_embedding_type', 'rope') == 'rope':
-            self.rotary_pos_emb = RotaryEmbedding(
-                kv_channels=config.kv_channels,
-                rotary_percent=getattr(config, 'rotary_percent', 1.0),
-                rotary_interleaved=config.rotary_interleaved,
-                seq_len_interpolation_factor=getattr(config, 'seq_len_interpolation_factor', None),
-                rotary_base=getattr(config, 'rotary_base', 10000),
-                rope_scaling=getattr(config, 'rope_scaling', False),
-                rope_scaling_factor=getattr(config, 'rope_scaling_factor', 8.0),
-                use_cpu_initialization=config.use_cpu_initialization,
-                cp_group=self.pg_collection.cp,
-            )
-        else:
-            self.rotary_pos_emb = None
 
     def backward_dw(self) -> None:
         """Execute weight update operations for all projections.
@@ -456,13 +426,6 @@ class LinearAttention(Attention):
             q = q.squeeze(1)  # [T, 1, h, d] -> [T, h, d]
             k = k.squeeze(1)  # [T, 1, kv_h, kv_d] -> [T, kv_h, kv_d]
 
-        # Check if we need to skip RoPE for this layer (aligned with Attention base class)
-        no_rope = (
-            self.config.no_rope_freq[self.layer_number - 1] if self.config.no_rope_freq else False
-        )
-        if no_rope:
-            rotary_pos_emb = None
-
         # For self attention, duplicate rotary_pos_emb if it isn't already a tuple
         if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
             rotary_pos_emb = (rotary_pos_emb,) * 2
@@ -470,7 +433,6 @@ class LinearAttention(Attention):
         # Apply RoPE on per-head Q/K tensors
         # Non-THD: q [sq, b, h, d], k [sq, b, kv_h, kv_d] (4D)
         # THD:     q [T, h, d], k [T, kv_h, kv_d] (3D, after squeeze)
-        mscale = _yarn_get_concentration_factor_from_config(self.config)
         if rotary_pos_cos is not None and rotary_pos_sin is not None:
             # Flash-decode path: use precomputed cos/sin directly
             q = apply_rotary_pos_emb_with_cos_sin(
@@ -482,49 +444,19 @@ class LinearAttention(Attention):
                 rotary_interleaved=self.config.rotary_interleaved,
             )
         elif rotary_pos_emb is not None:
-            # External RoPE tensor provided — dispatches to THD or BSHD variant
-            # based on whether cu_seqlens is provided
             q_pos_emb, k_pos_emb = rotary_pos_emb
             if q_pos_emb is not None:
                 q = apply_rotary_pos_emb(
                     q, q_pos_emb,
                     config=self.config,
                     cu_seqlens=cu_seqlens_q,
-                    mscale=mscale,
-                    cp_group=self.cp_group,
                 )
             if k_pos_emb is not None:
                 k = apply_rotary_pos_emb(
                     k, k_pos_emb,
                     config=self.config,
                     cu_seqlens=cu_seqlens_kv,
-                    mscale=mscale,
-                    cp_group=self.cp_group,
                 )
-        elif self.rotary_pos_emb is not None:
-            # No external RoPE provided (hybrid MLA mode) — compute internally
-            rotary_seq_len = sq
-            if inference_context is not None:
-                if hasattr(inference_context, 'sequence_len_offset'):
-                    rotary_seq_len += inference_context.sequence_len_offset
-                elif sequence_len_offset is not None:
-                    rotary_seq_len += sequence_len_offset
-            # forward() returns CP-aware freqs of shape [seq, 1, 1, dim]
-            freqs = self.rotary_pos_emb(rotary_seq_len)
-            q = apply_rotary_pos_emb(
-                q, freqs,
-                config=self.config,
-                cu_seqlens=cu_seqlens_q,
-                mscale=mscale,
-                cp_group=self.cp_group,
-            )
-            k = apply_rotary_pos_emb(
-                k, freqs,
-                config=self.config,
-                cu_seqlens=cu_seqlens_kv,
-                mscale=mscale,
-                cp_group=self.cp_group,
-            )
 
         # Reshape Q, K, V for GLA kernel [B, T, H, D]
         num_heads = self.num_attention_heads_per_partition

@@ -308,6 +308,9 @@ if [ "$DATA_PATH" = "/path/to/your/dataset_text_document" ]; then
     echo "Please set DATA_PATH environment variable to a valid dataset path."
     exit 1
 fi
+# Use the directory from DATA_PATH with the CI dataset name
+DATA_DIR=$(dirname "$DATA_PATH")
+DATA_PATH="${DATA_DIR}/High-Quality-Translated-To-English_text_document"
 if [ ! -e "$DATA_PATH.bin" ] || [ ! -e "$DATA_PATH.idx" ]; then
     echo "ERROR: Dataset files not found at: $DATA_PATH"
     echo "Expected files: ${DATA_PATH}.bin and ${DATA_PATH}.idx"
