@@ -279,6 +279,9 @@ TRAINING_ARGS=(
     --fp8-param-gather
     --fp8-recipe blockwise
     --fp8-format e4m3
+
+    # Keep expert_bias and local_tokens_per_expert in FP32 for precision
+    --skip-casting-dtype-for-param-pattern "^expert_bias$|.+\.expert_bias$|^local_tokens_per_expert$|.+\.local_tokens_per_expert$"
 )
 
 # ============================================================================
