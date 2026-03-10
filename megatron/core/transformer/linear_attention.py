@@ -6,6 +6,7 @@ This module implements the LinearAttention mechanism based on Lightning Attentio
 which uses slope tensors to compute decay factors for efficient attention computation.
 """
 
+import copy
 import math
 from typing import Optional, Tuple, Union
 
@@ -96,6 +97,14 @@ class LinearAttention(Attention):
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
         )
+
+        # Override config to disable MLA-specific RoPE dimension reordering.
+        # In hybrid MLA + LinearAttention mode, the global config has
+        # multi_latent_attention=True, but LinearAttention Q/K tensors do not
+        # use the MLA interleaved layout, so apply_rotary_pos_emb must not
+        # rearrange dimensions.  Match the reference implementation.
+        self.config = copy.deepcopy(config)
+        self.config.multi_latent_attention = False
 
         # Check GLA operators availability
         if not HAVE_GLA:

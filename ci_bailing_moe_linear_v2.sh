@@ -144,7 +144,7 @@ GPT_MODEL_ARGS=(
     --num-layers 20
     --hidden-size 2048
     --num-attention-heads 16
-    --num-query-groups 4
+    --num-query-groups 16
     --ffn-hidden-size 5120
 
     # Attention configuration
