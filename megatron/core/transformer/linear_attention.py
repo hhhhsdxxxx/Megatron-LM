@@ -564,16 +564,17 @@ class LinearAttention(Attention):
 
         # self.slope is already TP-local (sliced in __init__)
         local_slope = self.slope
-        slope_expanded = local_slope[None, None, :].expand(b, sq, num_heads)
 
         # Call GLA kernel with CP branching
+        # Use g_gamma (data-independent per-head decay) instead of g (data-dependent per-token gate)
+        # to match the reference chunk_lightning_attn wrapper which passes slope as g_gamma.
         cp_size = get_pg_size(self.pg_collection.cp)
         if cp_size <= 1:
             attn_output, recurrent_state = gla_fn(
                 q=q,
                 k=k,
                 v=v,
-                g=slope_expanded,
+                g_gamma=local_slope,
                 initial_state=recurrent_state,
                 output_final_state=output_final_state,
                 cu_seqlens=cu_seqlens_q,

@@ -442,11 +442,11 @@ class TestLinearAttentionForward:
 
         captured_args = {}
 
-        def fake_gla(q, k, v, g, initial_state=None, output_final_state=False):
+        def fake_gla(q, k, v, g_gamma=None, initial_state=None, output_final_state=False, **kw):
             captured_args['q_shape'] = q.shape
             captured_args['k_shape'] = k.shape
             captured_args['v_shape'] = v.shape
-            captured_args['g_shape'] = g.shape
+            captured_args['g_gamma_shape'] = g_gamma.shape
             # Return dummy output matching expected shape
             output = torch.randn_like(q)
             return output, None
@@ -477,10 +477,10 @@ class TestLinearAttentionForward:
         assert captured_args['v_shape'] == (b, sq, expected_heads, head_dim), (
             f"v shape {captured_args['v_shape']} should use TP-local heads"
         )
-        # slope (g) shape should be [b, sq, num_heads_local]
-        assert captured_args['g_shape'] == (b, sq, expected_heads), (
-            f"g (slope) shape {captured_args['g_shape']} should use TP-local heads "
-            f"({b}, {sq}, {expected_heads})"
+        # slope (g_gamma) shape should be [num_heads_local]
+        assert captured_args['g_gamma_shape'] == (expected_heads,), (
+            f"g_gamma (slope) shape {captured_args['g_gamma_shape']} should use TP-local heads "
+            f"({expected_heads},)"
         )
 
     def test_meg2_gqa_forward_expand_kv_to_local_heads(self):
@@ -505,7 +505,7 @@ class TestLinearAttentionForward:
 
         captured_args = {}
 
-        def fake_gla(q, k, v, g, initial_state=None, output_final_state=False):
+        def fake_gla(q, k, v, g_gamma=None, initial_state=None, output_final_state=False, **kw):
             captured_args['q_shape'] = q.shape
             captured_args['k_shape'] = k.shape
             captured_args['v_shape'] = v.shape
@@ -579,7 +579,7 @@ class TestLinearAttentionForward:
 
         captured_kwargs = {}
 
-        def fake_gla(q, k, v, g, **kw):
+        def fake_gla(q, k, v, **kw):
             captured_kwargs.update(kw)
             return v, None
 
@@ -731,7 +731,7 @@ class TestLinearAttentionForwardEndToEnd:
         Utils.destroy_model_parallel()
 
     @staticmethod
-    def _identity_gla(q, k, v, g, initial_state=None, output_final_state=False):
+    def _identity_gla(q, k, v, g_gamma=None, initial_state=None, output_final_state=False, **kw):
         """Stub GLA kernel that returns v unchanged (identity attention)."""
         final_state = torch.zeros(q.shape[0], q.shape[2], q.shape[3], q.shape[3]) \
             if output_final_state else None
@@ -762,11 +762,11 @@ class TestLinearAttentionForwardEndToEnd:
         chunk_called = [False]
         fused_called = [False]
 
-        def fake_chunk(q, k, v, g, **kw):
+        def fake_chunk(q, k, v, **kw):
             chunk_called[0] = True
             return v, None
 
-        def fake_fused(q, k, v, g, **kw):
+        def fake_fused(q, k, v, **kw):
             fused_called[0] = True
             return v, None
 
@@ -791,11 +791,11 @@ class TestLinearAttentionForwardEndToEnd:
         chunk_called = [False]
         fused_called = [False]
 
-        def fake_chunk(q, k, v, g, **kw):
+        def fake_chunk(q, k, v, **kw):
             chunk_called[0] = True
             return v, None
 
-        def fake_fused(q, k, v, g, **kw):
+        def fake_fused(q, k, v, **kw):
             fused_called[0] = True
             return v, None
 
@@ -840,7 +840,7 @@ class TestLinearAttentionForwardEndToEnd:
         # Use identity GLA so we can trace the gating
         captured = {}
 
-        def capture_gla(q, k, v, g, **kw):
+        def capture_gla(q, k, v, **kw):
             # Return ones so g_norm result is predictable
             output = torch.ones_like(v)
             return output, None
@@ -883,7 +883,7 @@ class TestLinearAttentionForwardEndToEnd:
             attn_mask_type=AttnMaskType.causal,
         )
 
-        def identity_gla(q, k, v, g, **kw):
+        def identity_gla(q, k, v, **kw):
             return torch.ones_like(v), None
 
         layer.gla_ops['chunk'] = identity_gla
