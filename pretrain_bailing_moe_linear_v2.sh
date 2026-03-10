@@ -149,7 +149,6 @@ GPT_MODEL_ARGS=(
     --position-embedding-type rope
     --rotary-base 10000
     --rotary-percent 0.5
-    --rotary-interleaved
     --max-position-embeddings 4096
 
     # Normalization
@@ -215,6 +214,9 @@ MOE_ARGS=(
 
     # Router z-loss (matching reference moe-z-loss-coeff)
     --moe-z-loss-coeff 0.0000035
+
+    # Router precision (matching reference)
+    --moe-router-dtype fp32
 
     # Expert configuration
     --moe-ffn-hidden-size 512
@@ -363,6 +365,7 @@ KERNEL_ARGS=(
     --attention-backend auto
     --no-masked-softmax-fusion
     --attention-softmax-in-fp32
+    --cross-entropy-loss-fusion
 )
 
 # ============================================================================

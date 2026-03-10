@@ -158,7 +158,6 @@ GPT_MODEL_ARGS=(
     --position-embedding-type rope
     --rotary-base 10000
     --rotary-percent 0.5
-    --rotary-interleaved
     --max-position-embeddings 4096
 
     # Normalization
@@ -384,6 +383,7 @@ KERNEL_ARGS=(
     --attention-backend auto
     --no-masked-softmax-fusion
     --attention-softmax-in-fp32
+    --cross-entropy-loss-fusion
 )
 
 # ============================================================================
