@@ -22,6 +22,13 @@ from megatron.core.transformer.group_rms_norm import GroupRMSNorm
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.utils import get_pg_rank, get_pg_size, divide
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.rope_utils import (
+    apply_rotary_pos_emb,
+    apply_rotary_pos_emb_with_cos_sin,
+)
+from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import (
+    _yarn_get_concentration_factor_from_config,
+)
 
 # Import GLA operators
 try:
@@ -62,6 +69,7 @@ class LinearAttention(Attention):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
+        rotary_pos_emb: Optional[RotaryEmbedding] = None,
     ):
         """Initialize LinearAttention layer.
 
@@ -74,6 +82,9 @@ class LinearAttention(Attention):
             cp_comm_type: Context parallel communication type
             pg_collection: Process group collection for distributed training
             pp_layer_offset: Pipeline parallel layer offset
+            rotary_pos_emb: External RotaryEmbedding instance. If provided, used
+                directly; otherwise an internal instance is constructed as fallback
+                (for hybrid MLA mode where GPTModel skips RoPE creation).
         """
         super().__init__(
             config=config,
@@ -189,20 +200,22 @@ class LinearAttention(Attention):
         else:
             self.k_layernorm = None
 
-        # Internal RotaryEmbedding for LinearAttention
-        # In hybrid MLA mode, gpt_model.py skips creating the external RoPE when
-        # config.multi_latent_attention is True (MLA creates its own internal RoPE).
-        # LinearAttention needs its own internal RoPE to ensure position embeddings
-        # are applied regardless of MLA configuration.
-        # Reference: LinearAttention always uses non-interleaved RoPE (rotate_half),
-        # so we hardcode rotary_interleaved=False.
-        self.rotary_interleaved = False
-        if getattr(config, 'position_embedding_type', 'rope') == 'rope':
+        # RotaryEmbedding for LinearAttention
+        # Accept an externally constructed instance (with full parameters like
+        # rope_scaling, seq_len_interpolation_factor, etc.) when available.
+        # Fall back to internal construction for hybrid MLA mode where GPTModel
+        # skips creating external RoPE (multi_latent_attention=True).
+        if rotary_pos_emb is not None:
+            self.rotary_pos_emb = rotary_pos_emb
+        elif getattr(config, 'position_embedding_type', 'rope') == 'rope':
             self.rotary_pos_emb = RotaryEmbedding(
                 kv_channels=config.kv_channels,
                 rotary_percent=getattr(config, 'rotary_percent', 1.0),
-                rotary_interleaved=False,
+                rotary_interleaved=config.rotary_interleaved,
+                seq_len_interpolation_factor=getattr(config, 'seq_len_interpolation_factor', None),
                 rotary_base=getattr(config, 'rotary_base', 10000),
+                rope_scaling=getattr(config, 'rope_scaling', False),
+                rope_scaling_factor=getattr(config, 'rope_scaling_factor', 8.0),
                 use_cpu_initialization=config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
@@ -422,57 +435,59 @@ class LinearAttention(Attention):
         if self.k_layernorm is not None:
             k = self.k_layernorm(k)
 
-        # P1 Fix: Apply RoPE on per-head Q/K tensors
-        # Keep q and k in [sq, b, num_heads, head_dim] shape for RoPE
-        # Megatron's RoPE helpers expect per-head layout where last dim is head_dim
-        #
-        # LinearAttention always uses non-interleaved RoPE (rotate_half, Llama-style),
-        # matching the reference apply_rotary_pos_emb() which uses rotate_half internally.
-        # When no external RoPE is provided (hybrid MLA mode), compute internally.
-        if rotary_pos_cos is not None and rotary_pos_sin is not None:
-            # Use cos/sin directly
-            from megatron.core.models.common.embeddings.rope_utils import (
-                apply_rotary_pos_emb_with_cos_sin,
-            )
+        # THD format: squeeze batch dim so apply_rotary_pos_emb dispatches to THD variant
+        is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        if is_thd:
+            q = q.squeeze(1)  # [T, 1, h, d] -> [T, h, d]
+            k = k.squeeze(1)  # [T, 1, kv_h, kv_d] -> [T, kv_h, kv_d]
 
+        # Check if we need to skip RoPE for this layer (aligned with Attention base class)
+        no_rope = (
+            self.config.no_rope_freq[self.layer_number - 1] if self.config.no_rope_freq else False
+        )
+        if no_rope:
+            rotary_pos_emb = None
+
+        # For self attention, duplicate rotary_pos_emb if it isn't already a tuple
+        if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
+            rotary_pos_emb = (rotary_pos_emb,) * 2
+
+        # Apply RoPE on per-head Q/K tensors
+        # Non-THD: q [sq, b, h, d], k [sq, b, kv_h, kv_d] (4D)
+        # THD:     q [T, h, d], k [T, kv_h, kv_d] (3D, after squeeze)
+        mscale = _yarn_get_concentration_factor_from_config(self.config)
+        if rotary_pos_cos is not None and rotary_pos_sin is not None:
+            # Flash-decode path: use precomputed cos/sin directly
             q = apply_rotary_pos_emb_with_cos_sin(
-                q, rotary_pos_cos, rotary_pos_sin, rotary_interleaved=self.rotary_interleaved
+                q, rotary_pos_cos, rotary_pos_sin,
+                rotary_interleaved=self.config.rotary_interleaved,
             )
             k = apply_rotary_pos_emb_with_cos_sin(
-                k, rotary_pos_cos, rotary_pos_sin, rotary_interleaved=self.rotary_interleaved
+                k, rotary_pos_cos, rotary_pos_sin,
+                rotary_interleaved=self.config.rotary_interleaved,
             )
         elif rotary_pos_emb is not None:
-            # Use rotary_pos_emb (freqs)
-            # Use lower-level _apply_rotary_pos_emb_bshd to override rotary_interleaved
-            from megatron.core.models.common.embeddings.rope_utils import (
-                _apply_rotary_pos_emb_bshd,
-            )
-
-            # Handle tuple format (q_pos_emb, k_pos_emb)
-            if isinstance(rotary_pos_emb, tuple):
-                q_pos_emb, k_pos_emb = rotary_pos_emb
-            else:
-                q_pos_emb = k_pos_emb = rotary_pos_emb
-
+            # External RoPE tensor provided — dispatches to THD or BSHD variant
+            # based on whether cu_seqlens is provided
+            q_pos_emb, k_pos_emb = rotary_pos_emb
             if q_pos_emb is not None:
-                q = _apply_rotary_pos_emb_bshd(
-                    q,
-                    q_pos_emb,
-                    rotary_interleaved=self.rotary_interleaved,
+                q = apply_rotary_pos_emb(
+                    q, q_pos_emb,
+                    config=self.config,
+                    cu_seqlens=cu_seqlens_q,
+                    mscale=mscale,
+                    cp_group=self.cp_group,
                 )
             if k_pos_emb is not None:
-                k = _apply_rotary_pos_emb_bshd(
-                    k,
-                    k_pos_emb,
-                    rotary_interleaved=self.rotary_interleaved,
+                k = apply_rotary_pos_emb(
+                    k, k_pos_emb,
+                    config=self.config,
+                    cu_seqlens=cu_seqlens_kv,
+                    mscale=mscale,
+                    cp_group=self.cp_group,
                 )
         elif self.rotary_pos_emb is not None:
             # No external RoPE provided (hybrid MLA mode) — compute internally
-            # Use forward() which handles CP-aware position remapping
-            from megatron.core.models.common.embeddings.rope_utils import (
-                _apply_rotary_pos_emb_bshd,
-            )
-
             rotary_seq_len = sq
             if inference_context is not None:
                 if hasattr(inference_context, 'sequence_len_offset'):
@@ -481,42 +496,54 @@ class LinearAttention(Attention):
                     rotary_seq_len += sequence_len_offset
             # forward() returns CP-aware freqs of shape [seq, 1, 1, dim]
             freqs = self.rotary_pos_emb(rotary_seq_len)
-            q = _apply_rotary_pos_emb_bshd(
-                q, freqs, rotary_interleaved=self.rotary_interleaved,
+            q = apply_rotary_pos_emb(
+                q, freqs,
+                config=self.config,
+                cu_seqlens=cu_seqlens_q,
+                mscale=mscale,
+                cp_group=self.cp_group,
             )
-            k = _apply_rotary_pos_emb_bshd(
-                k, freqs, rotary_interleaved=self.rotary_interleaved,
+            k = apply_rotary_pos_emb(
+                k, freqs,
+                config=self.config,
+                cu_seqlens=cu_seqlens_kv,
+                mscale=mscale,
+                cp_group=self.cp_group,
             )
 
-        # Flatten q and k back to [sq, b, num_heads * head_dim] after RoPE
-        q = q.view(sq, b, -1)
-        k = k.view(sq, b, -1)
-
-        # MEG-2: Reshape Q, K, V for GLA kernel using TP-local head counts
-        # QKV tensors are already TP-sharded (gather_output=False), so we must use
-        # partition-local head counts end-to-end to avoid shape mismatches under TP > 1.
-        # Megatron format: [sq, b, num_heads_local * head_dim]
-        # GLA format: [b, sq, num_heads_local, head_dim]
-        sq, b = q.size(0), q.size(1)
+        # Reshape Q, K, V for GLA kernel [B, T, H, D]
         num_heads = self.num_attention_heads_per_partition
         num_kv_heads = self.num_query_groups_per_partition
         head_dim = self.hidden_size_per_attention_head
         kv_head_dim = head_dim * self.config.kv_expand
 
-        # Reshape Q: [sq, b, num_heads_local * head_dim] -> [b, sq, num_heads_local, head_dim]
-        q = q.view(sq, b, num_heads, head_dim).transpose(0, 1).contiguous()
+        if is_thd:
+            # THD: q/k are 3D [T, h, d] after squeeze + RoPE
+            # Reshape v: [T, 1, kv_h * kv_d] -> [T, kv_h, kv_d]
+            v = v.squeeze(1).view(-1, num_kv_heads, kv_head_dim)
 
-        # Reshape K, V: [sq, b, num_kv_heads_local * kv_head_dim] -> [b, sq, num_kv_heads_local, kv_head_dim]
-        k = k.view(sq, b, num_kv_heads, kv_head_dim).transpose(0, 1).contiguous()
-        v = v.view(sq, b, num_kv_heads, kv_head_dim).transpose(0, 1).contiguous()
+            # GQA expansion on dim=1 (head dim for 3D tensors [T, h, d])
+            if num_kv_heads < num_heads:
+                num_groups = num_heads // num_kv_heads
+                k = k.repeat_interleave(num_groups, dim=1)
+                v = v.repeat_interleave(num_groups, dim=1)
 
-        # Handle GQA (grouped query attention) - expand K, V if needed
-        if num_kv_heads < num_heads:
-            # Repeat K, V to match num_heads
-            # [b, sq, num_kv_heads, head_dim] -> [b, sq, num_heads, head_dim]
-            num_groups = num_heads // num_kv_heads
-            k = k.repeat_interleave(num_groups, dim=2)
-            v = v.repeat_interleave(num_groups, dim=2)
+            # [T, h, d] -> [1, T, h, d] for GLA kernel (batch=1 for THD)
+            q = q.unsqueeze(0)
+            k = k.unsqueeze(0)
+            v = v.unsqueeze(0)
+        else:
+            # Non-THD: q/k are 4D [sq, b, h, d] after RoPE
+            # Transpose to [b, sq, h, d] for GLA kernel
+            q = q.transpose(0, 1).contiguous()
+            k = k.transpose(0, 1).contiguous()
+            v = v.view(sq, b, num_kv_heads, kv_head_dim).transpose(0, 1).contiguous()
+
+            # GQA expansion on dim=2 (head dim for 4D tensors [b, sq, h, d])
+            if num_kv_heads < num_heads:
+                num_groups = num_heads // num_kv_heads
+                k = k.repeat_interleave(num_groups, dim=2)
+                v = v.repeat_interleave(num_groups, dim=2)
 
         # Handle inference context (KV cache for recurrent state)
         recurrent_state = None
