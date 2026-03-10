@@ -391,9 +391,12 @@ class LinearAttention(Attention):
         # Get sequence length for mode selection
         sq = hidden_states.size(0)
 
-        # Select GLA mode based on sequence length
-        # Use fused_recurrent for short sequences (<=64), chunk for longer sequences
-        mode = 'fused_recurrent' if sq <= 64 else 'chunk'
+        # Select GLA mode: always use chunk during training to avoid shape issues
+        # with short sequences; only use fused_recurrent during inference
+        if inference_context is not None and sq <= 64:
+            mode = 'fused_recurrent'
+        else:
+            mode = 'chunk'
 
         # Project to QKV and split
         q, k, v = self.get_query_key_value_tensors(
